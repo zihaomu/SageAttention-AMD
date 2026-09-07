@@ -1,0 +1,48 @@
+name: Bug report
+description: Report incorrect output, a crash, dispatch failure, or build problem.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not disclose security vulnerabilities here; use private vulnerability reporting.
+  - type: input
+    id: commit
+    attributes:
+      label: Commit
+      description: Full commit SHA where the problem occurs.
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform profile
+      description: Registry platform ID, or GPU/host/ROCm details for a new platform.
+    validations:
+      required: true
+  - type: input
+    id: kernel
+    attributes:
+      label: Kernel and workload
+      description: Registry IDs plus the exact shape, layout, dtype, and mask mode.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction
+      description: Minimal command and input needed to reproduce the issue.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed and expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: Correctness metrics, logs, guard-canary output, or generated ISA excerpts.

@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "platform_id": "r9700-gfx1201-rocm7.2.3-ubuntu24.04",
+  "status": "validated",
+  "host": {
+    "cpu_model": "AMD EPYC 9334 32-Core Processor",
+    "cpu_sockets": 2,
+    "architecture": "x86_64",
+    "operating_system": "Ubuntu 24.04.1 LTS"
+  },
+  "gpu": {
+    "vendor": "AMD",
+    "model": "AMD Radeon AI PRO R9700",
+    "architecture": "gfx1201",
+    "vram_bytes": 34208743424,
+    "wavefront_sizes": [
+      32
+    ],
+    "device_count": 8
+  },
+  "software": {
+    "rocm_version": "7.2.3",
+    "hip_version": "7.2.53211-c2d9476115",
+    "compiler": "AMD clang 22.0.0git"
+  },
+  "notes": [
+    "Physical GPU indices are session-local and are recorded only in benchmark results.",
+    "Current device-code validation targets wave32."
+  ]
+}

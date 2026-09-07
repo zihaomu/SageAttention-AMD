@@ -1,5 +1,7 @@
 # SageAttention AMD
 
+[![Metadata](https://github.com/zihaomu/SageAttention-AMD/actions/workflows/metadata.yml/badge.svg)](https://github.com/zihaomu/SageAttention-AMD/actions/workflows/metadata.yml)
+
 Native C++17/HIP SageAttention kernels and sparse-attention planning for AMD
 GPUs. The project has no PyTorch, ATen, Triton, CUDA, or Python runtime
 dependency.
@@ -41,6 +43,26 @@ accepts raw device pointers, a HIP stream, geometry, and caller-owned
 workspace. A future generic interval-plan API will separate model-specific
 planning from the kernel dispatcher; the current VDN planner will remain one
 adapter/profile. See [Generalization roadmap](#generalization-roadmap).
+
+## Capability and evidence model
+
+The project tracks support as an explicit tuple of GPU architecture, wave size,
+ROCm/toolchain, layout, dtype, batch, head dimension, mask plan, and numerical
+mode. A measurement on one tuple is never treated as evidence for another.
+
+- [`registry/platforms/`](registry/platforms/) records validated machine
+  classes and software stacks.
+- [`registry/kernels/`](registry/kernels/) records the exact dispatch domain
+  and numerical contract of every specialization.
+- [`registry/workloads/`](registry/workloads/) records stable benchmark shapes
+  and mask semantics.
+- [`benchmarks/results/`](benchmarks/results/) joins those IDs to an immutable
+  measured session and source commit.
+
+Run `make metadata-check` to validate references and compatibility. The current
+validated tuple is R9700/gfx1201 wave32 on ROCm 7.2.3 with the experimental E27
+VDN `D=128` specialization. Registry presence does not by itself mean a kernel
+is a stable default; status and downstream quality are recorded separately.
 
 ## Build
 
@@ -153,6 +175,9 @@ include/   experimental public C++/HIP API
 src/       workspace planner, quantization, and gfx12 E27 kernel
 tests/     CPU contracts, GPU correctness/canaries, benchmark
 doc/       requirements, optimization ledger, decisions, H3 integration
+registry/  platform, kernel, and workload capability records
+benchmarks/append-only structured performance evidence
+tools/     development-time metadata validation
 ```
 
 Generated objects, profiler databases, and media outputs are intentionally
@@ -177,6 +202,7 @@ Near-term work should focus on the generic plan boundary and new validated
 specializations. Previously rejected producer/consumer, softmax batching,
 layout packing, and runtime exact/approximate hybrid experiments are recorded
 in the optimization ledger and should not be repeated without new evidence.
+The longer-term sequence is maintained in [`ROADMAP.md`](ROADMAP.md).
 
 ## Documentation
 
@@ -184,6 +210,17 @@ in the optimization ledger and should not be repeated without new evidence.
 - [Optimization ledger](doc/h3-vdn-sageattention-optimization.md)
 - [Requirements and gates](doc/vdn-sageattention-amd-cpp-requirements.md)
 - [H3 VDN integration](doc/h3-vdn-integration.md)
+- [Architecture and dispatch boundaries](doc/architecture.md)
+- [Benchmark protocol](doc/benchmarking.md)
+- [Support and compatibility policy](doc/support-policy.md)
+
+## Contributing
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for adding a platform, kernel shape,
+workload, or benchmark result. Issues include dedicated templates for kernel
+requests and reproducible benchmark contributions. Repository-level and scoped
+[`AGENTS.md`](AGENTS.md) files give coding agents the same evidence, GPU-safety,
+and promotion rules used by human contributors.
 
 ## Upstream provenance
 

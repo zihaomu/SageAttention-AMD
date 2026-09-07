@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "workload_id": "h3-vdn-s5338-h56-d128",
+  "description": "H3 VDN production-shaped sparse attention operator workload",
+  "measurement_scope": "operator-including-qk-quantization",
+  "shape": {
+    "batch": 1,
+    "sequence": 5338,
+    "heads": 56,
+    "head_dimension": 128,
+    "layout": "NHD",
+    "input_dtype": "bf16",
+    "output_dtype": "bf16"
+  },
+  "mask": {
+    "plan_class": "h3-vdn-interval-v1",
+    "video_start": 986,
+    "frames": 17,
+    "tokens_per_frame": 256,
+    "radius": 1,
+    "chunk": 5,
+    "anchor_both": true
+  }
+}

@@ -1,0 +1,44 @@
+name: Benchmark result
+description: Contribute a reproducible result from an AMD platform.
+title: "[Benchmark]: "
+labels: [benchmark]
+body:
+  - type: input
+    id: ids
+    attributes:
+      label: Platform, kernel, and workload IDs
+      description: List existing registry IDs or note which new records are needed.
+    validations:
+      required: true
+  - type: input
+    id: commit
+    attributes:
+      label: Clean source commit
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command and environment
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Raw result
+      description: Warm-ups, iterations, median/min/max, scope, and important sub-times.
+      render: text
+    validations:
+      required: true
+  - type: checkboxes
+    id: gates
+    attributes:
+      label: Measurement gates
+      options:
+        - label: The selected GPU was idle and explicitly isolated.
+          required: true
+        - label: Correctness, canaries, determinism, and required ISA checks passed.
+          required: true
+        - label: Operator and end-to-end measurements are labelled separately.
+          required: true

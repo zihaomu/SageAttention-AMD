@@ -1,0 +1,44 @@
+name: Kernel or shape request
+description: Propose an AMD architecture, dtype, layout, mask, or shape specialization.
+title: "[Kernel]: "
+labels: [kernel, enhancement]
+body:
+  - type: input
+    id: gpu
+    attributes:
+      label: AMD GPU and GFX architecture
+      placeholder: AMD Instinct MI300X / gfx942
+    validations:
+      required: true
+  - type: input
+    id: software
+    attributes:
+      label: ROCm, HIP, compiler, and OS
+    validations:
+      required: true
+  - type: textarea
+    id: shape
+    attributes:
+      label: Shape and numerical mode
+      description: Batch, sequence lengths, heads, head dimension, layout, dtypes, and quantization.
+    validations:
+      required: true
+  - type: textarea
+    id: attention
+    attributes:
+      label: Attention semantics
+      description: Dense, causal, sliding window, intervals, blocks, or another exact mask definition.
+    validations:
+      required: true
+  - type: textarea
+    id: baseline
+    attributes:
+      label: Baseline and target
+      description: Current implementation, measured latency/throughput, and desired improvement.
+    validations:
+      required: true
+  - type: textarea
+    id: consumer
+    attributes:
+      label: Consumer and quality gate
+      description: Downstream model/framework and the correctness or quality acceptance criteria.

@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "result_id": "2026-09-07-r9700-e27-h3-vdn-gpu4-a",
+  "recorded_at": "2026-09-07T15:38:04+08:00",
+  "evidence_level": "candidate",
+  "measurement_scope": "operator-including-qk-quantization",
+  "git_commit": "484058bb736590249b9dd3f262b6dc198ebd789a",
+  "source_dirty": false,
+  "platform_id": "r9700-gfx1201-rocm7.2.3-ubuntu24.04",
+  "kernel_id": "e27-vdn-gfx12-d128",
+  "workload_id": "h3-vdn-s5338-h56-d128",
+  "session": {
+    "physical_device_index": 4,
+    "gpu_use_percent_before": 1,
+    "command": "H3_PHYSICAL_GPU=4 make bench",
+    "warmup_iterations": 2,
+    "measured_iterations": 5
+  },
+  "metrics_ms": {
+    "metadata_cold": 0.056,
+    "q_quant": 0.471,
+    "k_quant": 0.398,
+    "attention": 14.02,
+    "profile_total": 14.889,
+    "event_median": 14.742,
+    "event_min": 14.71,
+    "event_max": 14.754,
+    "wall_per_iteration": 14.761
+  },
+  "resources": {
+    "tasks": 167,
+    "workspace_mib": 73.043
+  },
+  "correctness": {
+    "contract_test": "pass",
+    "gpu_test": "pass",
+    "isa_test": "pass",
+    "non_finite": 0,
+    "deterministic": true,
+    "output_hash": "d8fccefb0ea98938"
+  },
+  "qualification": {
+    "operator_gates": "pass",
+    "downstream_h3_audio_gate": "fail-0-of-3",
+    "note": "Candidate operator evidence; kernel remains experimental and explicit-only."
+  }
+}

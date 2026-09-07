@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "kernel_id": "e27-vdn-gfx12-d128",
+  "status": "experimental",
+  "implementation": {
+    "api": "include/h3_vdn_sage.hpp",
+    "host": "src/h3_vdn_sage.cpp",
+    "device": "src/h3_vdn_sage_gfx12.hip"
+  },
+  "dispatch": {
+    "gpu_architectures": [
+      "gfx1201"
+    ],
+    "wavefront_size": 32,
+    "layouts": [
+      "NHD"
+    ],
+    "batch_sizes": [
+      1
+    ],
+    "head_dimensions": [
+      128
+    ],
+    "input_dtypes": [
+      "bf16"
+    ],
+    "output_dtypes": [
+      "bf16"
+    ],
+    "mask_plan_classes": [
+      "h3-vdn-interval-v1"
+    ]
+  },
+  "algorithm": {
+    "qk": "signed-int8-wmma",
+    "pv": "bf16-wmma-fp32-accumulate",
+    "softmax": "streaming-fp32-online",
+    "q_tile_rows": 32,
+    "k_tile_rows": 64,
+    "head_dimension": 128,
+    "materializes_score_matrix": false
+  },
+  "quantization": {
+    "q_group_rows": 32,
+    "k_group_rows": 64,
+    "rounding": "round-to-nearest-with-explicit-clamp",
+    "range": [
+      -127,
+      127
+    ]
+  },
+  "validation": {
+    "operator_correctness": "pass",
+    "guard_canaries": "pass",
+    "determinism": "pass",
+    "isa": "pass",
+    "downstream_h3_audio_gate": "fail-0-of-3"
+  },
+  "limitations": [
+    "Explicit selection only; not an H3 automatic default.",
+    "FP16 and FP8 API modes are reserved and unsupported.",
+    "The current public planner is H3 VDN-specific pending the generic plan API."
+  ]
+}

@@ -4,6 +4,7 @@ CXX := $(ROCM_PATH)/bin/hipcc
 HIP_CLANG := $(ROCM_PATH)/llvm/bin/clang++
 HIP_FLAGS := $(addprefix --offload-arch=,$(HIP_ARCHS))
 SAGE_AMDGPU_FLAGS ?=
+PYTHON ?= python3
 CPPFLAGS := -Iinclude -Isrc
 CXXFLAGS := -std=c++17 -O3 -g -MMD -MP -Wall -Wextra -Wpedantic \
 	-Wshadow -Wconversion -Wno-sign-conversion $(HIP_FLAGS)
@@ -15,9 +16,12 @@ LIB_OBJECTS := $(BUILD_DIR)/h3_vdn_sage.o \
 LIBRARY := $(BUILD_DIR)/libsageattention_amd.a
 TEST_BINS := $(BUILD_DIR)/test_contract $(BUILD_DIR)/test_gpu
 
-.PHONY: all test contract-test gpu-test bench isa clean
+.PHONY: all test metadata-check contract-test gpu-test bench isa clean
 
 all: $(LIBRARY) $(TEST_BINS) $(BUILD_DIR)/bench_h3_vdn
+
+metadata-check:
+	$(PYTHON) tools/validate_registry.py
 
 $(BUILD_DIR):
 	mkdir -p $@
