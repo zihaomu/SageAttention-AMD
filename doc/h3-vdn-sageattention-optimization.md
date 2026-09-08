@@ -1202,3 +1202,31 @@ projection 中存在明显抵消，精确/近似混合会破坏该抵消，而�
 fallback 均没有得到同时满足速度和 audio 质量的候选。后续若没有 H3 专用校准/训练
 数据，应停止扩大混合规则搜索：保留 E27 作为约 18.7% 混合峰值利用率的显式研究模式，
 stable/`auto` 继续使用 wave32。
+
+### 12.5 下游 P9 重复路线复核与 smooth-K（REJECTED）
+
+2026-09-08 在准备将本仓库作为 `h3-vdn.c` 唯一 SageAttention 子仓库时，审计发现
+下游尚有一组未提交 P9 试验。全部正式样本均由物理 GPU 4/BDF `e3:00.0` 守护执行，
+exit 0、concurrency guard 为空且输出 finite。完整下游 diff 已保存为 H3 Git blob
+`a2ed5e0cc9a8fb056149b28abbe36c53ac9ca6cc`。
+
+- Q8/K16 把 E27 的 Q32/K64 scale group 收紧到 8/16。S=5837/H=56/D=128 五组
+  crossed operator 中位为 wave32 `0.501677 s`、候选 `0.018547 s`，但 prompt 2
+  production 8-NFE audio latent relative RMSE/cosine 为
+  **10.639524%/0.994340064**，同时违反 5%/0.999 门禁；video
+  `0.221297%/0.999997551` 通过。该结果强化 10.4 节已有 Q8/K16 REJECT，不新增长期
+  mode。
+- reference-aligned smooth-K 按 `[head,dimension]` 计算真实 sequence 的 F32 K mean，
+  K 减均值后仍做 K64 量化。CPU/GPU mean、INT8 bytes 和 scale oracle 逐项一致；五组
+  含税 operator 中位为 `0.501287→0.019663 s`。但 prompt 2 单 NFE/50 层的 combined
+  relative RMSE 为 **1.441189%**，audio 为 **5.227620%/0.998633146**，均差于 E27
+  和 Q8/K16，因此按 staged gate 停止 8-NFE。数学上不改变合法 key 集 softmax 的常量
+  shift 没有转化成 H3 的实际精度收益。
+- 只让前 17 层使用 E27、18--50 层使用 exact wave32 时，forward
+  `33.821389→33.920405 s`，combined relative RMSE/cosine 仍为
+  `1.1424441%/0.999934765`，audio `4.148523%/0.999141051`。后 33 层 exact 既未消除
+  已传播误差，也失去性能收益，与 A01/A11/A12 的结论一致。
+
+因此 Q8/K16、smooth-K 和新增 layer/NFE 调度只作为失败证据保留，全部从 H3 runtime
+清理。后续 Sage kernel 研究在本仓库完成并先通过 registry/operator 门禁，H3 只接入
+固定提交并执行模型级质量验证。
