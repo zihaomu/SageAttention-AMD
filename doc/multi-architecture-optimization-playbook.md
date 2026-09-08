@@ -21,7 +21,7 @@ the repository.
 | Campaign schema and validator | Complete | One registered-kernel smoke campaign is canonical and metadata-validated |
 | Search funnel and result draft | Complete for registered-kernel comparison | Static gates, short ranking, paired baseline, three-round confirmation, local result drafts, and report implemented |
 | Descriptor-based specialization registration | Complete for E27 | Host descriptor and device capability checks resolve through a registration table; public E27/H3 declarations are unchanged |
-| gfx1201 end-to-end reproduction | Complete as research evidence | Full E27 GPU suite passed and the registry-driven production run reproduced the accepted output hash |
+| gfx1201 end-to-end reproduction | Complete as research evidence | Full E27 GPU suite passed, the registry-driven production run reproduced the accepted output hash, and the smoke campaign was repeated from clean commit `d18ccef` |
 | First non-gfx12 campaign | Blocked on hardware | Requires an explicitly selected target machine |
 
 ## Goal
@@ -355,6 +355,24 @@ The proposed milestone for steps 1 through 6 is
   met. This is a workflow test, not a production performance conclusion.
 - All trial records and the report remained under ignored `build/sagectl/` and
   were labelled research evidence because the implementation tree was dirty.
+
+### 2026-09-08: clean-commit gfx1201 campaign reproduction
+
+- Re-ran `./tools/sagectl search --gpu 4 --campaign
+  gfx1201-ordered-interval-d128-smoke` from clean commit
+  `d18ccef01b35221ba0848eec934c4c0e8409cd5d`; the generated report records
+  `source_dirty: false` and physical device 4.
+- Metadata validation, the isolated gfx1201 host contract, and the required
+  E27 ISA gate all passed. E27's short-run geometric-mean speedup was
+  `0.9939869x` against the exact portable baseline.
+- Three same-session paired confirmations produced median speedup
+  `0.9332691x` and geometric-mean speedup `0.9487086x`. The configured `1.0x`
+  acceptance threshold was not met, so the campaign emitted no recommended
+  kernel and marked the result ineligible for promotion.
+- The ignored local report is
+  `build/sagectl/campaigns/gfx1201-ordered-interval-d128-smoke-20260908-073028-065771-z.json`.
+  This clean run establishes workflow reproducibility only; its tiny smoke
+  shape remains research evidence and is not a production performance claim.
 
 ### 2026-09-08: E27 descriptor registration and regression
 
