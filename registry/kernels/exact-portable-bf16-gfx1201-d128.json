@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "kernel_id": "exact-portable-bf16-gfx1201-d128",
+  "status": "experimental",
+  "selector": "portable_exact_reference",
+  "implementation": {
+    "header": "src/sage_attention_portable_reference.hpp",
+    "device": "src/sage_attention_portable_reference.hip",
+    "benchmark": "tests/bench_interval.cpp"
+  },
+  "dispatch": {
+    "gpu_architectures": [
+      "gfx1201"
+    ],
+    "wavefront_size": 32,
+    "layouts": [
+      "NHD"
+    ],
+    "batch_sizes": [
+      1
+    ],
+    "head_dimensions": [
+      128
+    ],
+    "input_dtypes": [
+      "bf16"
+    ],
+    "output_dtypes": [
+      "bf16"
+    ],
+    "mask_plan_classes": [
+      "ordered-interval-v1"
+    ]
+  },
+  "algorithm": {
+    "qk": "bf16-input-fp32-dot",
+    "pv": "bf16-input-fp32-accumulate",
+    "softmax": "streaming-fp32-online",
+    "threads_per_query": 256,
+    "materializes_score_matrix": false,
+    "purpose": "correctness-and-local-performance-baseline"
+  },
+  "validation": {
+    "operator_correctness": "pass-small-dense",
+    "guard_canaries": "pass",
+    "determinism": "pass",
+    "cpu_reference": "pass-small-dense"
+  },
+  "limitations": [
+    "Development baseline only; never selected as an optimized automatic default.",
+    "The first evidence record covers gfx1201 wave32 and D128 only.",
+    "The scalar key loop is intentionally clear rather than performance optimized."
+  ]
+}

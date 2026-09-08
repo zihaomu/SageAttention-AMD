@@ -1,0 +1,1405 @@
+#!/usr/bin/env python3
+"""Development CLI for SageAttention AMD machine and campaign workflows."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import datetime as dt
+import io
+import json
+import math
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import statistics
+from pathlib import Path
+from typing import Any, Sequence
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_ROCM_PATH = Path(os.environ.get("ROCM_PATH", "/opt/rocm"))
+
+
+class SagectlError(RuntimeError):
+    """Expected command failure with a user-facing explanation."""
+
+
+def run(
+    command: Sequence[str],
+    *,
+    env: dict[str, str] | None = None,
+    input_text: str | None = None,
+    cwd: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            list(command),
+            check=False,
+            text=True,
+            input=input_text,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=env,
+            cwd=cwd,
+        )
+    except OSError as exc:
+        raise SagectlError(f"cannot execute {command[0]}: {exc}") from exc
+
+
+def command_path(name: str, rocm_path: Path = DEFAULT_ROCM_PATH) -> str:
+    candidate = rocm_path / "bin" / name
+    if candidate.is_file():
+        return str(candidate)
+    discovered = shutil.which(name)
+    if discovered:
+        return discovered
+    raise SagectlError(f"required command not found: {name}")
+
+
+def parse_key_value_lines(text: str) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        key, separator, value = raw_line.partition("=")
+        if separator and key:
+            result[key.strip()] = value.strip()
+    return result
+
+
+def parse_os_release(text: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+
+def parse_hipcc_version(text: str) -> tuple[str, str]:
+    hip_match = re.search(r"^HIP version:\s*(\S+)", text, re.MULTILINE)
+    compiler_match = re.search(
+        r"^(AMD clang) version\s+(\S+)", text, re.MULTILINE
+    )
+    if not hip_match or not compiler_match:
+        raise SagectlError("hipcc --version did not expose HIP and compiler versions")
+    return hip_match.group(1), f"{compiler_match.group(1)} {compiler_match.group(2)}"
+
+
+def slug(value: str) -> str:
+    normalized = re.sub(r"[^a-z0-9.]+", "-", value.lower()).strip("-.")
+    if not normalized:
+        raise SagectlError(f"cannot create a stable ID component from {value!r}")
+    return normalized
+
+
+def gpu_slug(model: str) -> str:
+    for pattern in (r"\b(mi\d+[a-z0-9]*)\b", r"\b(r\d+[a-z0-9]*)\b"):
+        match = re.search(pattern, model.lower())
+        if match:
+            return match.group(1)
+    trimmed = re.sub(
+        r"\b(advanced micro devices|amd|ati|radeon|instinct|ai|pro|series)\b",
+        " ",
+        model,
+        flags=re.IGNORECASE,
+    )
+    return slug(trimmed)
+
+
+def rocm_version(rocm_path: Path, hipcc_output: str) -> str:
+    version_file = rocm_path / ".info" / "version"
+    if version_file.is_file():
+        value = version_file.read_text(encoding="utf-8").strip().splitlines()[0]
+        if value:
+            return value
+    match = re.search(r"\broc-(\d+(?:\.\d+)+)\b", hipcc_output)
+    if match:
+        return match.group(1)
+    raise SagectlError("cannot determine ROCm version")
+
+
+def cpu_model() -> str:
+    cpuinfo = Path("/proc/cpuinfo")
+    if cpuinfo.is_file():
+        for line in cpuinfo.read_text(encoding="utf-8", errors="replace").splitlines():
+            key, separator, value = line.partition(":")
+            if separator and key.strip() in {"model name", "Processor"}:
+                return value.strip()
+    return platform.processor() or "unknown"
+
+
+def cpu_socket_count() -> int | None:
+    cpuinfo = Path("/proc/cpuinfo")
+    if not cpuinfo.is_file():
+        return None
+    physical_ids = set()
+    for line in cpuinfo.read_text(encoding="utf-8", errors="replace").splitlines():
+        key, separator, value = line.partition(":")
+        if separator and key.strip() == "physical id":
+            physical_ids.add(value.strip())
+    return len(physical_ids) or None
+
+
+def os_information() -> tuple[str, str]:
+    path = Path("/etc/os-release")
+    values = parse_os_release(
+        path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
+    )
+    pretty = values.get("PRETTY_NAME") or platform.platform()
+    os_id = values.get("ID", platform.system().lower())
+    version_id = values.get("VERSION_ID", platform.release())
+    return pretty, slug(f"{os_id}{version_id}")
+
+
+def parse_rocm_smi(text: str) -> list[dict[str, Any]]:
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        raise SagectlError("rocm-smi returned no device data")
+    reader = csv.DictReader(io.StringIO("\n".join(lines)))
+    devices: list[dict[str, Any]] = []
+    for unnormalized_row in reader:
+        row = {
+            (key or "").strip(): (value or "").strip()
+            for key, value in unnormalized_row.items()
+        }
+        raw_device = row.get("device", "")
+        match = re.fullmatch(r"card(\d+)", raw_device)
+        if not match:
+            continue
+
+        def integer_with_prefix(prefix: str) -> int | None:
+            for key, value in row.items():
+                if key and key.startswith(prefix) and value is not None:
+                    try:
+                        return int(value)
+                    except ValueError:
+                        return None
+            return None
+
+        devices.append(
+            {
+                "index": int(match.group(1)),
+                "gpu_use_percent": integer_with_prefix("GPU use"),
+                "memory_use_percent": integer_with_prefix(
+                    "GPU Memory Allocated"
+                ),
+                "model": row.get("Card Series") or None,
+                "architecture": row.get("GFX Version") or None,
+            }
+        )
+    if not devices:
+        raise SagectlError("cannot parse physical devices from rocm-smi CSV")
+    return devices
+
+
+HIP_PROBE_SOURCE = r"""
+#include <hip/hip_runtime.h>
+
+#include <cstdio>
+
+__global__ void sage_probe_kernel(int *value) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) *value = 42;
+}
+
+int main() {
+    hipDeviceProp_t properties = {};
+    int *device_value = nullptr;
+    int host_value = 0;
+    if (hipGetDeviceProperties(&properties, 0) != hipSuccess ||
+        hipMalloc(&device_value, sizeof(int)) != hipSuccess) return 2;
+    sage_probe_kernel<<<1, 1>>>(device_value);
+    if (hipGetLastError() != hipSuccess ||
+        hipMemcpy(&host_value, device_value, sizeof(int),
+                  hipMemcpyDeviceToHost) != hipSuccess) return 3;
+    if (hipFree(device_value) != hipSuccess) return 5;
+    if (host_value != 42) return 4;
+    std::printf("name=%s\n", properties.name);
+    std::printf("architecture=%s\n", properties.gcnArchName);
+    std::printf("vram_bytes=%llu\n",
+                static_cast<unsigned long long>(properties.totalGlobalMem));
+    std::printf("wavefront_size=%d\n", properties.warpSize);
+    std::printf("compute_units=%d\n", properties.multiProcessorCount);
+    std::printf("runtime_probe=pass\n");
+    return 0;
+}
+"""
+
+
+def hip_runtime_probe(
+    hipcc: str, gpu_index: int, architecture: str | None
+) -> dict[str, str]:
+    with tempfile.TemporaryDirectory(prefix="sagectl-probe-") as directory:
+        source = Path(directory) / "probe.hip"
+        binary = Path(directory) / "probe"
+        source.write_text(HIP_PROBE_SOURCE, encoding="utf-8")
+        command = [hipcc, "-std=c++17", "-O2"]
+        if architecture:
+            command.append(f"--offload-arch={architecture}")
+        command.extend([str(source), "-o", str(binary)])
+        compiled = run(command)
+        if compiled.returncode:
+            raise SagectlError(f"minimal HIP probe compilation failed:\n{compiled.stdout}")
+        environment = os.environ.copy()
+        environment["ROCR_VISIBLE_DEVICES"] = str(gpu_index)
+        environment["HIP_VISIBLE_DEVICES"] = "0"
+        executed = run([str(binary)], env=environment)
+        if executed.returncode:
+            raise SagectlError(f"minimal HIP runtime probe failed:\n{executed.stdout}")
+        result = parse_key_value_lines(executed.stdout)
+        required = {
+            "name",
+            "architecture",
+            "vram_bytes",
+            "wavefront_size",
+            "runtime_probe",
+        }
+        missing = required - result.keys()
+        if missing:
+            raise SagectlError(
+                "minimal HIP probe omitted fields: " + ", ".join(sorted(missing))
+            )
+        return result
+
+
+def make_platform_record(
+    *,
+    probe: dict[str, str],
+    device_count: int,
+    rocm: str,
+    hip: str,
+    compiler: str,
+    operating_system: str,
+    os_slug: str,
+    requested_platform_id: str | None = None,
+) -> dict[str, Any]:
+    architecture = probe["architecture"].split(":", 1)[0]
+    wavefront_size = int(probe["wavefront_size"])
+    model = probe["name"]
+    platform_id = requested_platform_id or (
+        f"{gpu_slug(model)}-{slug(architecture)}-rocm{slug(rocm)}-{os_slug}"
+    )
+    if not re.fullmatch(r"[a-z0-9]+(?:[a-z0-9.-]*[a-z0-9])?", platform_id):
+        raise SagectlError("platform ID must be stable, lowercase, and hyphen-separated")
+    host: dict[str, Any] = {
+        "cpu_model": cpu_model(),
+        "architecture": platform.machine(),
+        "operating_system": operating_system,
+    }
+    sockets = cpu_socket_count()
+    if sockets is not None:
+        host["cpu_sockets"] = sockets
+    return {
+        "schema_version": 1,
+        "platform_id": platform_id,
+        "status": "experimental",
+        "host": host,
+        "gpu": {
+            "vendor": "AMD",
+            "model": model,
+            "architecture": architecture,
+            "vram_bytes": int(probe["vram_bytes"]),
+            "wavefront_sizes": [wavefront_size],
+            "device_count": device_count,
+        },
+        "software": {
+            "rocm_version": rocm,
+            "hip_version": hip,
+            "compiler": compiler,
+        },
+        "notes": [
+            "Machine-generated draft; review before moving into registry/platforms.",
+            "Physical GPU indices are session-local and are excluded from this record.",
+        ],
+    }
+
+
+def ensure_inside_repository(path: Path) -> Path:
+    resolved = path.resolve()
+    try:
+        resolved.relative_to(ROOT)
+    except ValueError as exc:
+        raise SagectlError("generated files must stay inside the repository") from exc
+    return resolved
+
+
+def write_canonical_json(path: Path, record: dict[str, Any], force: bool) -> None:
+    path = ensure_inside_repository(path)
+    if path.exists() and not force:
+        raise SagectlError(f"refusing to overwrite existing file without --force: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(record, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def load_registry_record(category: str, record_id: str) -> dict[str, Any]:
+    if category not in {"platforms", "kernels", "workloads"}:
+        raise SagectlError(f"unsupported registry category: {category}")
+    if not re.fullmatch(r"[a-z0-9]+(?:[a-z0-9.-]*[a-z0-9])?", record_id):
+        raise SagectlError(f"invalid registry ID: {record_id}")
+    path = ROOT / "registry" / category / f"{record_id}.json"
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise SagectlError(f"registry record not found: {path.relative_to(ROOT)}") from exc
+    except json.JSONDecodeError as exc:
+        raise SagectlError(f"invalid registry JSON: {path.relative_to(ROOT)}: {exc}") from exc
+    expected_key = {"platforms": "platform_id", "kernels": "kernel_id", "workloads": "workload_id"}[category]
+    if not isinstance(record, dict) or record.get(expected_key) != record_id:
+        raise SagectlError(f"registry identity mismatch: {path.relative_to(ROOT)}")
+    return record
+
+
+def load_json_inside_repository(path_text: str, identity_key: str) -> dict[str, Any]:
+    path = ensure_inside_repository(Path(path_text))
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise SagectlError(f"draft record not found: {path.relative_to(ROOT)}") from exc
+    except json.JSONDecodeError as exc:
+        raise SagectlError(f"invalid draft JSON: {path.relative_to(ROOT)}: {exc}") from exc
+    if not isinstance(record, dict) or not isinstance(record.get(identity_key), str):
+        raise SagectlError(f"draft record is missing {identity_key}")
+    return record
+
+
+def append_and_merge_interval(
+    intervals: list[tuple[int, int]], begin: int, end: int
+) -> None:
+    if begin >= end:
+        return
+    intervals.append((begin, end))
+
+
+def merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    merged: list[tuple[int, int]] = []
+    for begin, end in sorted(intervals):
+        if merged and begin <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((begin, end))
+    return merged
+
+
+def h3_intervals(mask: dict[str, Any], sequence: int, query: int) -> list[tuple[int, int]]:
+    video_start = int(mask["video_start"])
+    frames = int(mask["frames"])
+    tokens_per_frame = int(mask["tokens_per_frame"])
+    radius = int(mask["radius"])
+    chunk = int(mask["chunk"])
+    anchor_both = bool(mask["anchor_both"])
+    video_end = video_start + frames * tokens_per_frame
+    if query < video_start or query >= video_end:
+        return [(0, sequence)]
+    frame = (query - video_start) // tokens_per_frame
+    if anchor_both and (frame == 0 or frame + 1 == frames):
+        return [(0, sequence)]
+
+    candidates: list[tuple[int, int]] = []
+    append_and_merge_interval(candidates, 0, video_start)
+    if anchor_both:
+        append_and_merge_interval(
+            candidates, video_start, video_start + tokens_per_frame
+        )
+    if chunk:
+        query_chunk = frame // chunk
+        lower_chunk = max(query_chunk - radius, 0)
+        chunk_count = (frames + chunk - 1) // chunk
+        upper_chunks = query_chunk + radius + 1
+        lower = lower_chunk * chunk
+        upper = frames - 1 if upper_chunks >= chunk_count else upper_chunks * chunk - 1
+    else:
+        lower = max(frame - radius, 0)
+        upper = min(frame + radius, frames - 1)
+    append_and_merge_interval(
+        candidates,
+        video_start + lower * tokens_per_frame,
+        video_start + (upper + 1) * tokens_per_frame,
+    )
+    if anchor_both:
+        append_and_merge_interval(
+            candidates, video_end - tokens_per_frame, video_end
+        )
+    append_and_merge_interval(candidates, video_end, sequence)
+    return merge_intervals(candidates)
+
+
+def h3_tasks(workload: dict[str, Any]) -> list[dict[str, Any]]:
+    shape = workload["shape"]
+    mask = workload["mask"]
+    sequence = int(shape["sequence"])
+    video_start = int(mask["video_start"])
+    frames = int(mask["frames"])
+    tokens_per_frame = int(mask["tokens_per_frame"])
+    chunk = int(mask["chunk"])
+    anchor_both = bool(mask["anchor_both"])
+    video_end = video_start + frames * tokens_per_frame
+    if (
+        video_start < 0
+        or frames <= 0
+        or tokens_per_frame <= 0
+        or video_end > sequence
+    ):
+        raise SagectlError("invalid h3-vdn-v1 workload geometry")
+    tasks: list[dict[str, Any]] = []
+    row = 0
+    while row < sequence:
+        intervals = h3_intervals(mask, sequence, row)
+        if row < video_start:
+            class_end = video_start
+        elif row >= video_end:
+            class_end = sequence
+        else:
+            frame = (row - video_start) // tokens_per_frame
+            if anchor_both and frame == 0:
+                end_frame = 1
+            elif anchor_both and frame + 1 == frames:
+                end_frame = frames
+            elif chunk:
+                candidate = (frame // chunk + 1) * chunk
+                end_frame = min(candidate, frames)
+                if anchor_both and end_frame == frames:
+                    end_frame -= 1
+            else:
+                end_frame = frame + 1
+            class_end = video_start + end_frame * tokens_per_frame
+        if class_end <= row or class_end > sequence:
+            class_end = row + 1
+        while row < class_end:
+            q_count = min(32, class_end - row)
+            tasks.append(
+                {"q_begin": row, "q_count": q_count, "intervals": intervals}
+            )
+            row += q_count
+    return tasks
+
+
+def generate_interval_tasks(workload: dict[str, Any]) -> list[dict[str, Any]]:
+    shape = workload.get("shape")
+    mask = workload.get("mask")
+    if not isinstance(shape, dict) or not isinstance(mask, dict):
+        raise SagectlError("workload shape and mask must be objects")
+    sequence = shape.get("sequence")
+    if not isinstance(sequence, int) or sequence <= 0:
+        raise SagectlError("workload shape.sequence must be positive")
+    generator = mask.get("generator") or mask.get("planner")
+    if generator == "h3-vdn-v1":
+        tasks = h3_tasks(workload)
+    elif generator == "dense-v1":
+        q_tile_rows = mask.get("q_tile_rows", 32)
+        if not isinstance(q_tile_rows, int) or not 1 <= q_tile_rows <= 32:
+            raise SagectlError("dense-v1 q_tile_rows must be in [1, 32]")
+        tasks = [
+            {
+                "q_begin": begin,
+                "q_count": min(q_tile_rows, sequence - begin),
+                "intervals": [(0, sequence)],
+            }
+            for begin in range(0, sequence, q_tile_rows)
+        ]
+    elif generator == "causal-v1":
+        tasks = [
+            {"q_begin": row, "q_count": 1, "intervals": [(0, row + 1)]}
+            for row in range(sequence)
+        ]
+    elif generator == "explicit-v1":
+        raw_tasks = mask.get("tasks")
+        if not isinstance(raw_tasks, list):
+            raise SagectlError("explicit-v1 requires mask.tasks")
+        tasks = raw_tasks
+    else:
+        raise SagectlError(f"unsupported workload interval generator: {generator!r}")
+    validate_generated_tasks(sequence, tasks)
+    return tasks
+
+
+def validate_generated_tasks(sequence: int, tasks: list[dict[str, Any]]) -> None:
+    next_query = 0
+    if not tasks:
+        raise SagectlError("generated plan has no tasks")
+    for index, task in enumerate(tasks):
+        q_begin = task.get("q_begin")
+        q_count = task.get("q_count")
+        intervals = task.get("intervals")
+        if q_begin != next_query or not isinstance(q_count, int) or not 1 <= q_count <= 32:
+            raise SagectlError(f"generated task {index} has invalid query coverage")
+        if next_query + q_count > sequence:
+            raise SagectlError(f"generated task {index} exceeds query sequence")
+        if not isinstance(intervals, list) or not 1 <= len(intervals) <= 5:
+            raise SagectlError(f"generated task {index} must contain 1..5 intervals")
+        previous_end = 0
+        for interval_index, interval in enumerate(intervals):
+            if not isinstance(interval, (list, tuple)) or len(interval) != 2:
+                raise SagectlError(f"generated task {index} has malformed interval")
+            begin, end = interval
+            if (
+                not isinstance(begin, int)
+                or not isinstance(end, int)
+                or begin < 0
+                or begin >= end
+                or end > sequence
+                or (interval_index and begin < previous_end)
+            ):
+                raise SagectlError(f"generated task {index} has invalid intervals")
+            previous_end = end
+        next_query += q_count
+    if next_query != sequence:
+        raise SagectlError("generated plan does not cover every query row")
+
+
+def write_interval_plan(path: Path, tasks: list[dict[str, Any]]) -> None:
+    path = ensure_inside_repository(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [f"sage-interval-plan-v1 {len(tasks)}"]
+    for task in tasks:
+        values = [str(task["q_begin"]), str(task["q_count"]), str(len(task["intervals"]))]
+        for begin, end in task["intervals"]:
+            values.extend((str(begin), str(end)))
+        lines.append(" ".join(values))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def plan_command(args: argparse.Namespace) -> int:
+    workload = load_registry_record("workloads", args.workload)
+    tasks = generate_interval_tasks(workload)
+    output = (
+        Path(args.output)
+        if args.output
+        else ROOT / "build" / "sagectl" / "plans" / f"{args.workload}.plan"
+    )
+    write_interval_plan(output, tasks)
+    print(
+        json.dumps(
+            {
+                "workload_id": args.workload,
+                "task_count": len(tasks),
+                "plan": str(output.resolve().relative_to(ROOT)),
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def registry_compatibility(
+    platform_record: dict[str, Any],
+    kernel_record: dict[str, Any],
+    workload_record: dict[str, Any],
+) -> None:
+    dispatch = kernel_record["dispatch"]
+    shape = workload_record["shape"]
+    checks = (
+        (platform_record["gpu"]["architecture"], dispatch["gpu_architectures"], "architecture"),
+        (shape["batch"], dispatch["batch_sizes"], "batch"),
+        (shape["head_dimension"], dispatch["head_dimensions"], "head dimension"),
+        (shape["layout"], dispatch["layouts"], "layout"),
+        (shape["input_dtype"], dispatch["input_dtypes"], "input dtype"),
+        (shape["output_dtype"], dispatch["output_dtypes"], "output dtype"),
+        (workload_record["mask"]["plan_class"], dispatch["mask_plan_classes"], "mask plan"),
+    )
+    for value, allowed, label in checks:
+        if value not in allowed:
+            raise SagectlError(f"workload/platform {label} is outside kernel dispatch")
+    if dispatch["wavefront_size"] not in platform_record["gpu"]["wavefront_sizes"]:
+        raise SagectlError("platform wavefront size is outside kernel dispatch")
+
+
+def make_portable_kernel_record(
+    platform_record: dict[str, Any], workload_record: dict[str, Any]
+) -> dict[str, Any]:
+    gpu = platform_record["gpu"]
+    shape = workload_record["shape"]
+    waves = gpu["wavefront_sizes"]
+    if not isinstance(waves, list) or len(waves) != 1 or waves[0] not in {32, 64}:
+        raise SagectlError(
+            "portable baseline draft requires one probed wavefront size"
+        )
+    architecture = gpu["architecture"]
+    head_dimension = shape["head_dimension"]
+    kernel_id = (
+        f"exact-portable-bf16-{slug(architecture)}-d{head_dimension}"
+    )
+    return {
+        "schema_version": 1,
+        "kernel_id": kernel_id,
+        "status": "experimental",
+        "selector": "portable_exact_reference",
+        "implementation": {
+            "header": "src/sage_attention_portable_reference.hpp",
+            "device": "src/sage_attention_portable_reference.hip",
+            "benchmark": "tests/bench_interval.cpp",
+        },
+        "dispatch": {
+            "gpu_architectures": [architecture],
+            "wavefront_size": waves[0],
+            "layouts": [shape["layout"]],
+            "batch_sizes": [shape["batch"]],
+            "head_dimensions": [head_dimension],
+            "input_dtypes": [shape["input_dtype"]],
+            "output_dtypes": [shape["output_dtype"]],
+            "mask_plan_classes": [workload_record["mask"]["plan_class"]],
+        },
+        "algorithm": {
+            "qk": "bf16-input-fp32-dot",
+            "pv": "bf16-input-fp32-accumulate",
+            "softmax": "streaming-fp32-online",
+            "threads_per_query": 256,
+            "materializes_score_matrix": False,
+            "purpose": "correctness-and-local-performance-baseline",
+        },
+        "validation": {
+            "operator_correctness": "pending-local-baseline",
+            "guard_canaries": "pending-local-baseline",
+            "determinism": "pending-local-baseline",
+            "cpu_reference": "pending-local-baseline",
+        },
+        "limitations": [
+            "Machine-generated draft; review after baseline qualification.",
+            "Development baseline only; never selected as an optimized automatic default.",
+            "The scalar key loop is intentionally clear rather than performance optimized.",
+        ],
+    }
+
+
+def find_registered_portable_kernel(
+    platform_record: dict[str, Any], workload_record: dict[str, Any]
+) -> dict[str, Any] | None:
+    for path in sorted((ROOT / "registry" / "kernels").glob("*.json")):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(record, dict) or record.get("selector") != "portable_exact_reference":
+            continue
+        try:
+            registry_compatibility(platform_record, record, workload_record)
+        except SagectlError:
+            continue
+        return record
+    return None
+
+
+def git_source_state() -> tuple[str, bool]:
+    revision = run(["git", "rev-parse", "HEAD"], cwd=ROOT)
+    status = run(
+        ["git", "status", "--porcelain", "--untracked-files=all"], cwd=ROOT
+    )
+    if revision.returncode or status.returncode:
+        raise SagectlError("cannot inspect Git source state")
+    return revision.stdout.strip(), bool(status.stdout.strip())
+
+
+def parse_runner_json(output: str) -> dict[str, Any]:
+    for line in reversed(output.splitlines()):
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and value.get("runner") == "generic-interval-v1":
+            return value
+    raise SagectlError(f"benchmark runner returned no result JSON:\n{output}")
+
+
+def architecture_build_directory(architecture: str) -> Path:
+    return Path("build") / "sagectl" / "architectures" / slug(architecture)
+
+
+def benchmark_command(args: argparse.Namespace) -> int:
+    platform_record = getattr(args, "_platform_record", None) or load_registry_record(
+        "platforms", args.platform
+    )
+    kernel_record = getattr(args, "_kernel_record", None) or load_registry_record(
+        "kernels", args.kernel
+    )
+    workload_record = load_registry_record("workloads", args.workload)
+    registry_compatibility(platform_record, kernel_record, workload_record)
+    selector = kernel_record.get("selector")
+    platform_id = platform_record["platform_id"]
+    kernel_id = kernel_record["kernel_id"]
+    if selector not in {
+        "automatic_select",
+        "e27_gfx12_d128",
+        "portable_exact_reference",
+    }:
+        raise SagectlError(f"kernel record has no supported public selector: {selector!r}")
+
+    rocm_path = Path(args.rocm_path)
+    rocm_smi = command_path("rocm-smi", rocm_path)
+    smi = run([rocm_smi, "--showproductname", "--showuse", "--showmemuse", "--csv"])
+    if smi.returncode:
+        raise SagectlError(f"rocm-smi preflight failed:\n{smi.stdout}")
+    devices = parse_rocm_smi(smi.stdout)
+    selected = next((device for device in devices if device["index"] == args.gpu), None)
+    if selected is None:
+        raise SagectlError(f"physical GPU {args.gpu} was not found")
+    if selected["architecture"] != platform_record["gpu"]["architecture"]:
+        raise SagectlError("selected GPU architecture does not match platform record")
+    gpu_use = selected["gpu_use_percent"]
+    memory_use = selected["memory_use_percent"]
+    if (
+        gpu_use is None
+        or memory_use is None
+        or gpu_use > args.max_gpu_use
+        or memory_use > args.max_memory_use
+    ):
+        raise SagectlError(
+            f"selected GPU is not idle enough: use={gpu_use}% memory={memory_use}%"
+        )
+
+    tasks = generate_interval_tasks(workload_record)
+    plan_path = ROOT / "build" / "sagectl" / "plans" / f"{args.workload}.plan"
+    write_interval_plan(plan_path, tasks)
+    architecture = platform_record["gpu"]["architecture"]
+    build_directory = architecture_build_directory(architecture)
+    benchmark_target = build_directory / "bench_interval"
+    built = run(
+        [
+            "make",
+            f"HIP_ARCHS={architecture}",
+            f"BUILD_DIR={build_directory}",
+            str(benchmark_target),
+        ],
+        env=os.environ.copy(),
+        cwd=ROOT,
+    )
+    if built.returncode:
+        raise SagectlError(f"generic interval benchmark build failed:\n{built.stdout}")
+
+    shape = workload_record["shape"]
+    runner_command = [
+        str(ROOT / benchmark_target),
+        str(plan_path),
+        str(shape["sequence"]),
+        str(shape["heads"]),
+        str(shape["head_dimension"]),
+        str(args.iterations),
+        selector,
+    ]
+    environment = os.environ.copy()
+    environment["ROCR_VISIBLE_DEVICES"] = str(args.gpu)
+    environment["HIP_VISIBLE_DEVICES"] = "0"
+    measured = run(runner_command, env=environment)
+    if measured.returncode:
+        raise SagectlError(f"generic interval benchmark failed:\n{measured.stdout}")
+    runner_result = parse_runner_json(measured.stdout)
+    if not runner_result["architecture"].startswith(architecture):
+        raise SagectlError("benchmark runtime architecture differs from platform record")
+
+    revision, source_dirty = git_source_state()
+    recorded_at = dt.datetime.now().astimezone()
+    timestamp = recorded_at.astimezone(dt.timezone.utc).strftime(
+        "%Y%m%d-%H%M%S-%f-z"
+    )
+    result_id = f"{timestamp}-{platform_id}-{kernel_id}-{args.workload}"
+    result_record = {
+        "schema_version": 1,
+        "result_id": result_id,
+        "recorded_at": recorded_at.isoformat(timespec="seconds"),
+        "evidence_level": "research",
+        "measurement_scope": workload_record["measurement_scope"],
+        "git_commit": revision,
+        "source_dirty": source_dirty,
+        "platform_id": platform_id,
+        "kernel_id": kernel_id,
+        "workload_id": args.workload,
+        "session": {
+            "physical_device_index": args.gpu,
+            "gpu_use_percent_before": gpu_use,
+            "gpu_memory_percent_before": memory_use,
+            "command": (
+                f"./tools/sagectl benchmark --gpu {args.gpu} "
+                f"--platform {platform_id} --kernel {kernel_id} "
+                f"--workload {args.workload} --iterations {args.iterations}"
+            ),
+            "warmup_iterations": runner_result["warmup_iterations"],
+            "measured_iterations": runner_result["measured_iterations"],
+            "runner": runner_result["runner"],
+        },
+        "metrics_ms": runner_result["metrics_ms"],
+        "resources": {
+            "tasks": runner_result["task_count"],
+            "workspace_bytes": runner_result["workspace_bytes"],
+        },
+        "correctness": {
+            "contract_test": "not-run-by-benchmark-command",
+            "gpu_test": "benchmark-smoke-pass",
+            "isa_test": "not-run-by-benchmark-command",
+            "non_finite": runner_result["correctness"]["non_finite"],
+            "deterministic": runner_result["correctness"]["deterministic"],
+            "guard_canaries": runner_result["correctness"]["guard_canaries"],
+            "output_hash": runner_result["correctness"]["output_hash"],
+            "cpu_reference": runner_result["correctness"]["cpu_reference"],
+            "cpu_max_abs": runner_result["correctness"]["cpu_max_abs"],
+            "cpu_relative_rmse": runner_result["correctness"][
+                "cpu_relative_rmse"
+            ],
+        },
+    }
+    result_path = ROOT / "build" / "sagectl" / "results" / f"{result_id}.json"
+    write_canonical_json(result_path, result_record, force=False)
+    print(
+        json.dumps(
+            {
+                "platform_id": platform_id,
+                "kernel_id": kernel_id,
+                "workload_id": args.workload,
+                "source_dirty": source_dirty,
+                "metrics_ms": runner_result["metrics_ms"],
+                "correctness": runner_result["correctness"],
+                "draft_result": str(result_path.relative_to(ROOT)),
+                **getattr(args, "_additional_summary", {}),
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def baseline_command(args: argparse.Namespace) -> int:
+    if args.platform_draft:
+        platform_record = load_json_inside_repository(
+            args.platform_draft, "platform_id"
+        )
+    else:
+        platform_record = load_registry_record("platforms", args.platform)
+    workload_record = load_registry_record("workloads", args.workload)
+    kernel_record = find_registered_portable_kernel(
+        platform_record, workload_record
+    )
+    additional_summary: dict[str, str] = {}
+    if kernel_record is None:
+        kernel_record = make_portable_kernel_record(
+            platform_record, workload_record
+        )
+        draft_path = (
+            ROOT
+            / "build"
+            / "sagectl"
+            / "kernels"
+            / f"{kernel_record['kernel_id']}.json"
+        )
+        write_canonical_json(draft_path, kernel_record, force=True)
+        additional_summary["kernel_draft"] = str(draft_path.relative_to(ROOT))
+    args.platform = platform_record["platform_id"]
+    args.kernel = kernel_record["kernel_id"]
+    args._platform_record = platform_record
+    args._kernel_record = kernel_record
+    args._additional_summary = additional_summary
+    return benchmark_command(args)
+
+
+def load_campaign(campaign_id: str) -> dict[str, Any]:
+    if not re.fullmatch(r"[a-z0-9]+(?:[a-z0-9.-]*[a-z0-9])?", campaign_id):
+        raise SagectlError(f"invalid campaign ID: {campaign_id}")
+    path = ROOT / "benchmarks" / "campaigns" / f"{campaign_id}.json"
+    try:
+        campaign = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise SagectlError(f"campaign not found: {path.relative_to(ROOT)}") from exc
+    except json.JSONDecodeError as exc:
+        raise SagectlError(f"invalid campaign JSON: {exc}") from exc
+    if not isinstance(campaign, dict) or campaign.get("campaign_id") != campaign_id:
+        raise SagectlError("campaign identity mismatch")
+    return campaign
+
+
+def invoke_benchmark(
+    *,
+    gpu: int,
+    platform_id: str,
+    kernel_id: str,
+    workload_id: str,
+    iterations: int,
+    rocm_path: str,
+    max_gpu_use: int,
+    max_memory_use: int,
+) -> dict[str, Any]:
+    command = [
+        sys.executable,
+        str(ROOT / "tools" / "sagectl"),
+        "benchmark",
+        "--gpu",
+        str(gpu),
+        "--platform",
+        platform_id,
+        "--kernel",
+        kernel_id,
+        "--workload",
+        workload_id,
+        "--iterations",
+        str(iterations),
+        "--rocm-path",
+        rocm_path,
+        "--max-gpu-use",
+        str(max_gpu_use),
+        "--max-memory-use",
+        str(max_memory_use),
+    ]
+    completed = run(command, cwd=ROOT)
+    if completed.returncode:
+        raise SagectlError(
+            f"benchmark trial failed for {kernel_id}/{workload_id}:\n"
+            f"{completed.stdout}"
+        )
+    try:
+        result = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise SagectlError(
+            f"benchmark trial returned invalid summary JSON:\n{completed.stdout}"
+        ) from exc
+    if not isinstance(result, dict):
+        raise SagectlError("benchmark trial summary must be an object")
+    return result
+
+
+def trial_passes_gates(summary: dict[str, Any], gates: dict[str, Any]) -> bool:
+    correctness = summary.get("correctness", {})
+    if correctness.get("non_finite") != 0:
+        return False
+    if gates.get("require_determinism") and correctness.get("deterministic") is not True:
+        return False
+    if gates.get("require_guard_canaries") and correctness.get("guard_canaries") is not True:
+        return False
+    if gates.get("require_cpu_reference") and correctness.get("cpu_reference") != "pass":
+        return False
+    return True
+
+
+def geometric_mean(values: Sequence[float]) -> float:
+    if not values or any(value <= 0.0 for value in values):
+        raise SagectlError("geometric mean requires positive values")
+    return math.exp(sum(math.log(value) for value in values) / len(values))
+
+
+def run_static_campaign_gates(campaign: dict[str, Any]) -> list[dict[str, str]]:
+    platform_record = load_registry_record("platforms", campaign["platform_id"])
+    architecture = platform_record["gpu"]["architecture"]
+    build_directory = architecture_build_directory(architecture)
+    make_prefix = [
+        "make",
+        f"HIP_ARCHS={architecture}",
+        f"BUILD_DIR={build_directory}",
+    ]
+    commands = [
+        ["make", "metadata-check"],
+        [*make_prefix, "contract-test"],
+    ]
+    selectors = {
+        load_registry_record("kernels", kernel_id).get("selector")
+        for kernel_id in [
+            campaign["baseline_kernel_id"],
+            *campaign["candidate_kernel_ids"],
+        ]
+    }
+    if "e27_gfx12_d128" in selectors:
+        commands.append([*make_prefix, "isa"])
+    records: list[dict[str, str]] = []
+    for command in commands:
+        completed = run(command, cwd=ROOT)
+        if completed.returncode:
+            raise SagectlError(
+                f"static campaign gate failed: {' '.join(command)}\n"
+                f"{completed.stdout}"
+            )
+        records.append({"command": " ".join(command), "status": "pass"})
+    return records
+
+
+def search_command(args: argparse.Namespace) -> int:
+    campaign = load_campaign(args.campaign)
+    static_gates = run_static_campaign_gates(campaign)
+    platform_id = campaign["platform_id"]
+    baseline_id = campaign["baseline_kernel_id"]
+    candidate_ids = campaign["candidate_kernel_ids"]
+    workload_ids = campaign["workload_ids"]
+    gates = campaign["gates"]
+    metric = campaign["objective"]["metric"]
+    short_iterations = gates["short_iterations"]
+    confirmation_iterations = gates["confirmation_iterations"]
+    confirmation_runs = gates["confirmation_runs"]
+    top_k = gates["top_k_for_confirmation"]
+    trials: list[dict[str, Any]] = []
+
+    short_baselines: dict[str, float] = {}
+    for workload_id in workload_ids:
+        baseline = invoke_benchmark(
+            gpu=args.gpu,
+            platform_id=platform_id,
+            kernel_id=baseline_id,
+            workload_id=workload_id,
+            iterations=short_iterations,
+            rocm_path=args.rocm_path,
+            max_gpu_use=args.max_gpu_use,
+            max_memory_use=args.max_memory_use,
+        )
+        if not trial_passes_gates(baseline, gates):
+            raise SagectlError(f"baseline failed campaign gates: {workload_id}")
+        short_baselines[workload_id] = baseline["metrics_ms"][metric]
+        trials.append(
+            {
+                "stage": "short",
+                "role": "baseline",
+                "workload_id": workload_id,
+                "summary": baseline,
+            }
+        )
+
+    rankings: list[dict[str, Any]] = []
+    for kernel_id in candidate_ids:
+        speedups: list[float] = []
+        passed = True
+        for workload_id in workload_ids:
+            candidate = invoke_benchmark(
+                gpu=args.gpu,
+                platform_id=platform_id,
+                kernel_id=kernel_id,
+                workload_id=workload_id,
+                iterations=short_iterations,
+                rocm_path=args.rocm_path,
+                max_gpu_use=args.max_gpu_use,
+                max_memory_use=args.max_memory_use,
+            )
+            gate_pass = trial_passes_gates(candidate, gates)
+            passed = passed and gate_pass
+            candidate_metric = candidate["metrics_ms"][metric]
+            speedup = short_baselines[workload_id] / candidate_metric
+            speedups.append(speedup)
+            trials.append(
+                {
+                    "stage": "short",
+                    "role": "candidate",
+                    "kernel_id": kernel_id,
+                    "workload_id": workload_id,
+                    "gate_pass": gate_pass,
+                    "paired_speedup": speedup,
+                    "summary": candidate,
+                }
+            )
+        rankings.append(
+            {
+                "kernel_id": kernel_id,
+                "gate_pass": passed,
+                "short_geomean_speedup": geometric_mean(speedups),
+            }
+        )
+    eligible = sorted(
+        (entry for entry in rankings if entry["gate_pass"]),
+        key=lambda entry: entry["short_geomean_speedup"],
+        reverse=True,
+    )
+    if not eligible:
+        raise SagectlError("no candidate survived the short-run gates")
+    finalists = [entry["kernel_id"] for entry in eligible[:top_k]]
+
+    confirmed_speedups: dict[str, list[float]] = {
+        kernel_id: [] for kernel_id in finalists
+    }
+    for confirmation_run in range(confirmation_runs):
+        for workload_id in workload_ids:
+            baseline = invoke_benchmark(
+                gpu=args.gpu,
+                platform_id=platform_id,
+                kernel_id=baseline_id,
+                workload_id=workload_id,
+                iterations=confirmation_iterations,
+                rocm_path=args.rocm_path,
+                max_gpu_use=args.max_gpu_use,
+                max_memory_use=args.max_memory_use,
+            )
+            if not trial_passes_gates(baseline, gates):
+                raise SagectlError("confirmation baseline failed campaign gates")
+            baseline_metric = baseline["metrics_ms"][metric]
+            trials.append(
+                {
+                    "stage": "confirmation",
+                    "round": confirmation_run + 1,
+                    "role": "baseline",
+                    "workload_id": workload_id,
+                    "summary": baseline,
+                }
+            )
+            for kernel_id in finalists:
+                candidate = invoke_benchmark(
+                    gpu=args.gpu,
+                    platform_id=platform_id,
+                    kernel_id=kernel_id,
+                    workload_id=workload_id,
+                    iterations=confirmation_iterations,
+                    rocm_path=args.rocm_path,
+                    max_gpu_use=args.max_gpu_use,
+                    max_memory_use=args.max_memory_use,
+                )
+                if not trial_passes_gates(candidate, gates):
+                    raise SagectlError(
+                        f"confirmation candidate failed gates: {kernel_id}"
+                    )
+                speedup = baseline_metric / candidate["metrics_ms"][metric]
+                confirmed_speedups[kernel_id].append(speedup)
+                trials.append(
+                    {
+                        "stage": "confirmation",
+                        "round": confirmation_run + 1,
+                        "role": "candidate",
+                        "kernel_id": kernel_id,
+                        "workload_id": workload_id,
+                        "paired_speedup": speedup,
+                        "summary": candidate,
+                    }
+                )
+
+    confirmations = [
+        {
+            "kernel_id": kernel_id,
+            "paired_speedup_median": statistics.median(speedups),
+            "paired_speedup_geomean": geometric_mean(speedups),
+            "paired_samples": len(speedups),
+        }
+        for kernel_id, speedups in confirmed_speedups.items()
+    ]
+    confirmations.sort(
+        key=lambda entry: entry["paired_speedup_median"], reverse=True
+    )
+    best = confirmations[0]
+    accepted = (
+        best["paired_speedup_median"]
+        >= float(campaign["acceptance"]["minimum_speedup"])
+    )
+    revision, source_dirty = git_source_state()
+    recorded_at = dt.datetime.now().astimezone()
+    timestamp = recorded_at.astimezone(dt.timezone.utc).strftime(
+        "%Y%m%d-%H%M%S-%f-z"
+    )
+    report = {
+        "schema_version": 1,
+        "campaign_id": args.campaign,
+        "recorded_at": recorded_at.isoformat(timespec="seconds"),
+        "git_commit": revision,
+        "source_dirty": source_dirty,
+        "evidence_level": "research",
+        "physical_device_index": args.gpu,
+        "objective": campaign["objective"],
+        "static_gates": static_gates,
+        "short_rankings": rankings,
+        "confirmations": confirmations,
+        "recommendation": {
+            "kernel_id": best["kernel_id"] if accepted else None,
+            "accepted_by_campaign_threshold": accepted,
+            "promotion_eligible": False,
+            "note": "Local campaign recommendation only; review clean-commit evidence before promotion.",
+        },
+        "trials": trials,
+    }
+    report_path = (
+        ROOT
+        / "build"
+        / "sagectl"
+        / "campaigns"
+        / f"{args.campaign}-{timestamp}.json"
+    )
+    write_canonical_json(report_path, report, force=False)
+    print(
+        json.dumps(
+            {
+                "campaign_id": args.campaign,
+                "source_dirty": source_dirty,
+                "short_rankings": rankings,
+                "confirmations": confirmations,
+                "recommendation": report["recommendation"],
+                "report": str(report_path.relative_to(ROOT)),
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def report_command(args: argparse.Namespace) -> int:
+    directory = ROOT / "build" / "sagectl" / "campaigns"
+    candidates = sorted(directory.glob(f"{args.campaign}-*.json"))
+    if not candidates:
+        raise SagectlError(f"no local report found for campaign: {args.campaign}")
+    report = json.loads(candidates[-1].read_text(encoding="utf-8"))
+    print(
+        json.dumps(
+            {
+                "campaign_id": report["campaign_id"],
+                "recorded_at": report["recorded_at"],
+                "source_dirty": report["source_dirty"],
+                "short_rankings": report["short_rankings"],
+                "confirmations": report["confirmations"],
+                "recommendation": report["recommendation"],
+                "report": str(candidates[-1].relative_to(ROOT)),
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def doctor(args: argparse.Namespace) -> int:
+    rocm_path = Path(args.rocm_path)
+    hipcc = command_path("hipcc", rocm_path)
+    rocm_smi = command_path("rocm-smi", rocm_path)
+    smi = run([rocm_smi, "--showproductname", "--showuse", "--showmemuse", "--csv"])
+    if smi.returncode:
+        raise SagectlError(f"rocm-smi probe failed:\n{smi.stdout}")
+    devices = parse_rocm_smi(smi.stdout)
+    selected = next((device for device in devices if device["index"] == args.gpu), None)
+    if selected is None:
+        available = ", ".join(str(device["index"]) for device in devices)
+        raise SagectlError(f"physical GPU {args.gpu} not found; available: {available}")
+
+    hipcc_version = run([hipcc, "--version"])
+    if hipcc_version.returncode:
+        raise SagectlError(f"hipcc --version failed:\n{hipcc_version.stdout}")
+    hip, compiler = parse_hipcc_version(hipcc_version.stdout)
+    rocm = rocm_version(rocm_path, hipcc_version.stdout)
+    probe = hip_runtime_probe(hipcc, args.gpu, selected["architecture"])
+    if selected["architecture"] and not probe["architecture"].startswith(
+        selected["architecture"]
+    ):
+        raise SagectlError(
+            "rocm-smi and HIP disagree on selected GPU architecture: "
+            f"{selected['architecture']} versus {probe['architecture']}"
+        )
+    operating_system, os_slug = os_information()
+    record = make_platform_record(
+        probe=probe,
+        device_count=len(devices),
+        rocm=rocm,
+        hip=hip,
+        compiler=compiler,
+        operating_system=operating_system,
+        os_slug=os_slug,
+        requested_platform_id=args.platform_id,
+    )
+    output = (
+        Path(args.output)
+        if args.output
+        else ROOT / "build" / "sagectl" / "platforms" / f"{record['platform_id']}.json"
+    )
+    write_canonical_json(output, record, args.force)
+
+    gpu_use = selected["gpu_use_percent"]
+    memory_use = selected["memory_use_percent"]
+    benchmark_ready = (
+        gpu_use is not None
+        and memory_use is not None
+        and gpu_use <= args.max_gpu_use
+        and memory_use <= args.max_memory_use
+    )
+    summary = {
+        "selected_physical_gpu": args.gpu,
+        "gpu_use_percent": gpu_use,
+        "memory_use_percent": memory_use,
+        "benchmark_ready": benchmark_ready,
+        "runtime_probe": probe["runtime_probe"],
+        "platform_id": record["platform_id"],
+        "draft": str(output.resolve().relative_to(ROOT)),
+    }
+    print(json.dumps(summary, indent=2))
+    if args.require_idle and not benchmark_ready:
+        raise SagectlError(
+            "selected GPU does not satisfy the requested idle thresholds"
+        )
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="sagectl")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    doctor_parser = subparsers.add_parser(
+        "doctor", help="probe one explicit AMD GPU and generate a platform draft"
+    )
+    doctor_parser.add_argument("--gpu", type=int, required=True, help="physical GPU index")
+    doctor_parser.add_argument(
+        "--rocm-path", default=str(DEFAULT_ROCM_PATH), help="ROCm installation prefix"
+    )
+    doctor_parser.add_argument("--platform-id", help="reviewed stable platform ID")
+    doctor_parser.add_argument(
+        "--output", help="draft path inside the repository (default: build/sagectl/platforms/)"
+    )
+    doctor_parser.add_argument("--force", action="store_true", help="replace an existing draft")
+    doctor_parser.add_argument("--require-idle", action="store_true")
+    doctor_parser.add_argument("--max-gpu-use", type=int, default=5)
+    doctor_parser.add_argument("--max-memory-use", type=int, default=1)
+    doctor_parser.set_defaults(function=doctor)
+
+    plan_parser = subparsers.add_parser(
+        "plan", help="generate a canonical interval plan from a workload record"
+    )
+    plan_parser.add_argument("--workload", required=True)
+    plan_parser.add_argument("--output", help="plan path inside the repository")
+    plan_parser.set_defaults(function=plan_command)
+
+    benchmark_parser = subparsers.add_parser(
+        "benchmark", help="run a registry-driven generic interval benchmark"
+    )
+    benchmark_parser.add_argument("--gpu", type=int, required=True)
+    benchmark_parser.add_argument("--platform", required=True)
+    benchmark_parser.add_argument("--kernel", required=True)
+    benchmark_parser.add_argument("--workload", required=True)
+    benchmark_parser.add_argument("--iterations", type=int, default=5)
+    benchmark_parser.add_argument(
+        "--rocm-path", default=str(DEFAULT_ROCM_PATH), help="ROCm installation prefix"
+    )
+    benchmark_parser.add_argument("--max-gpu-use", type=int, default=5)
+    benchmark_parser.add_argument("--max-memory-use", type=int, default=1)
+    benchmark_parser.set_defaults(function=benchmark_command)
+
+    baseline_parser = subparsers.add_parser(
+        "baseline", help="qualify and benchmark the registered portable exact baseline"
+    )
+    baseline_parser.add_argument("--gpu", type=int, required=True)
+    platform_group = baseline_parser.add_mutually_exclusive_group(required=True)
+    platform_group.add_argument("--platform")
+    platform_group.add_argument(
+        "--platform-draft", help="doctor-generated platform JSON inside the repository"
+    )
+    baseline_parser.add_argument("--workload", required=True)
+    baseline_parser.add_argument("--iterations", type=int, default=5)
+    baseline_parser.add_argument(
+        "--rocm-path", default=str(DEFAULT_ROCM_PATH), help="ROCm installation prefix"
+    )
+    baseline_parser.add_argument("--max-gpu-use", type=int, default=5)
+    baseline_parser.add_argument("--max-memory-use", type=int, default=1)
+    baseline_parser.set_defaults(function=baseline_command)
+
+    search_parser = subparsers.add_parser(
+        "search", help="execute a validated optimization campaign"
+    )
+    search_parser.add_argument("--gpu", type=int, required=True)
+    search_parser.add_argument("--campaign", required=True)
+    search_parser.add_argument(
+        "--rocm-path", default=str(DEFAULT_ROCM_PATH), help="ROCm installation prefix"
+    )
+    search_parser.add_argument("--max-gpu-use", type=int, default=5)
+    search_parser.add_argument("--max-memory-use", type=int, default=1)
+    search_parser.set_defaults(function=search_command)
+
+    report_parser = subparsers.add_parser(
+        "report", help="show the latest local report for a campaign"
+    )
+    report_parser.add_argument("--campaign", required=True)
+    report_parser.set_defaults(function=report_command)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return int(args.function(args))
+    except SagectlError as exc:
+        print(f"sagectl: error: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

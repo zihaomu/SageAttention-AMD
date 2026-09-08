@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <limits>
 
@@ -34,6 +35,70 @@ bool checked_align(std::size_t value, std::size_t alignment,
 
 namespace sageattention {
 
+namespace {
+
+constexpr kernel_registration kKernelRegistrations[] = {
+    {kernel_id::e27_gfx12_d128,
+     "e27_gfx12_d128",
+     {"gfx1200", "gfx1201"},
+     32,
+     layout::nhd,
+     data_type::bf16,
+     data_type::bf16,
+     qk_mode::symmetric_i8,
+     pv_mode::bf16,
+     1,
+     128,
+     32,
+     max_intervals_per_task},
+};
+
+bool descriptor_matches_registration(
+    const descriptor &operation,
+    const kernel_registration &registration) {
+    const tensor_shape &shape = operation.shape;
+    return shape.tensor_layout == registration.tensor_layout &&
+           shape.batch == registration.batch &&
+           shape.query_sequence == shape.key_value_sequence &&
+           shape.query_heads == shape.key_value_heads &&
+           shape.head_dimension == registration.head_dimension &&
+           operation.options.input_type == registration.input_type &&
+           operation.options.output_type == registration.output_type &&
+           operation.options.qk == registration.qk &&
+           operation.options.pv == registration.pv;
+}
+
+}  // namespace
+
+const kernel_registration *resolve_kernel_registration(
+    const descriptor &operation) {
+    for (const kernel_registration &registration : kKernelRegistrations) {
+        if (operation.options.kernel != kernel_id::automatic_select &&
+            operation.options.kernel != registration.id) {
+            continue;
+        }
+        if (descriptor_matches_registration(operation, registration))
+            return &registration;
+    }
+    return nullptr;
+}
+
+bool device_matches_registration(
+    const kernel_registration &registration,
+    const hipDeviceProp_t &properties) {
+    if (properties.warpSize !=
+        static_cast<int>(registration.wavefront_size)) {
+        return false;
+    }
+    for (const char *prefix : registration.architecture_prefixes) {
+        if (prefix && std::strncmp(properties.gcnArchName, prefix,
+                                   std::strlen(prefix)) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 hipError_t validate_descriptor(const descriptor &operation) {
     const tensor_shape &shape = operation.shape;
     if (!shape.batch || !shape.query_sequence || !shape.key_value_sequence ||
@@ -42,16 +107,7 @@ hipError_t validate_descriptor(const descriptor &operation) {
         operation.task_count > UINT32_MAX) {
         return hipErrorInvalidValue;
     }
-    if (shape.tensor_layout != layout::nhd || shape.batch != 1 ||
-        shape.query_sequence != shape.key_value_sequence ||
-        shape.query_heads != shape.key_value_heads ||
-        shape.head_dimension != 128 ||
-        operation.options.input_type != data_type::bf16 ||
-        operation.options.output_type != data_type::bf16 ||
-        operation.options.qk != qk_mode::symmetric_i8 ||
-        operation.options.pv != pv_mode::bf16 ||
-        (operation.options.kernel != kernel_id::automatic_select &&
-         operation.options.kernel != kernel_id::e27_gfx12_d128)) {
+    if (!resolve_kernel_registration(operation)) {
         return hipErrorNotSupported;
     }
     return hipSuccess;
@@ -66,14 +122,17 @@ hipError_t validate_interval_plan(const descriptor &operation,
     }
 
     std::uint32_t next_query = 0;
+    const kernel_registration *registration =
+        resolve_kernel_registration(operation);
+    if (!registration) return hipErrorNotSupported;
     for (std::size_t task_index = 0; task_index < plan.task_count;
          ++task_index) {
         const q_task &task = plan.tasks[task_index];
         if (task.q_begin != next_query || !task.q_count ||
-            task.q_count > 32 ||
+            task.q_count > registration->max_query_rows_per_task ||
             task.q_count > operation.shape.query_sequence - next_query ||
             !task.interval_count ||
-            task.interval_count > max_intervals_per_task) {
+            task.interval_count > registration->max_intervals) {
             return hipErrorInvalidValue;
         }
         std::uint32_t previous_end = 0;

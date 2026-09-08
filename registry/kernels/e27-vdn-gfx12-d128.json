@@ -2,6 +2,7 @@
   "schema_version": 1,
   "kernel_id": "e27-vdn-gfx12-d128",
   "status": "experimental",
+  "selector": "e27_gfx12_d128",
   "implementation": {
     "generic_api": "include/sage_attention.hpp",
     "generic_host": "src/sage_attention.cpp",

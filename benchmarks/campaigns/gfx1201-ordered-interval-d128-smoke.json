@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "campaign_id": "gfx1201-ordered-interval-d128-smoke",
+  "status": "experimental",
+  "platform_id": "r9700-gfx1201-rocm7.2.3-ubuntu24.04",
+  "workload_ids": [
+    "ordered-interval-dense-s35-h1-d128"
+  ],
+  "baseline_kernel_id": "exact-portable-bf16-gfx1201-d128",
+  "candidate_kernel_ids": [
+    "e27-vdn-gfx12-d128"
+  ],
+  "hypothesis": "The registered E27 specialization and portable exact reference can exercise the complete campaign funnel on gfx1201 without changing either implementation.",
+  "objective": {
+    "metric": "event_median",
+    "direction": "minimize",
+    "measurement_scope": "operator-including-qk-quantization"
+  },
+  "search_space": {
+    "kind": "registered-kernel-comparison",
+    "kernel_ids": [
+      "e27-vdn-gfx12-d128"
+    ]
+  },
+  "gates": {
+    "require_cpu_reference": true,
+    "require_guard_canaries": true,
+    "require_determinism": true,
+    "short_iterations": 3,
+    "confirmation_iterations": 5,
+    "confirmation_runs": 3,
+    "top_k_for_confirmation": 1
+  },
+  "acceptance": {
+    "minimum_speedup": 1.0,
+    "stopping_rule": "Complete the declared registered-kernel comparison; do not generate new kernel source in this smoke campaign."
+  }
+}

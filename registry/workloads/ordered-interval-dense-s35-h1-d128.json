@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "workload_id": "ordered-interval-dense-s35-h1-d128",
+  "description": "Small model-independent dense interval-plan smoke workload",
+  "measurement_scope": "operator-including-qk-quantization",
+  "shape": {
+    "batch": 1,
+    "sequence": 35,
+    "heads": 1,
+    "head_dimension": 128,
+    "layout": "NHD",
+    "input_dtype": "bf16",
+    "output_dtype": "bf16"
+  },
+  "mask": {
+    "plan_class": "ordered-interval-v1",
+    "generator": "dense-v1",
+    "q_tile_rows": 32
+  }
+}

@@ -28,6 +28,19 @@ benchmark records are the source of truth.
 - Automate compile checks where public runners are available and retain
   hardware-in-the-loop promotion for performance and correctness.
 
+## Optimization infrastructure
+
+- Add a machine probe that generates reviewable platform metadata without
+  recording machine identity or transient device indices.
+- Add a portable exact GPU reference and parameterized workload runner before
+  searching another architecture.
+- Define bounded optimization campaigns with compile, ISA/resource,
+  correctness, short-run, and repeated-confirmation stages.
+- Generate draft immutable result records from campaign runs while preserving
+  rejected directions in an optimization ledger.
+- Follow the [multi-architecture optimization playbook](doc/multi-architecture-optimization-playbook.md)
+  for onboarding, automation boundaries, agent behavior, and promotion.
+
 ## Distribution and integration
 
 - Add CMake package configuration and semantic API/version policy.

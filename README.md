@@ -104,6 +104,36 @@ The recipes expose only the selected HSA agent with `ROCR_VISIBLE_DEVICES`,
 then address it as HIP device 0. Use a confirmed idle card for performance
 measurements.
 
+### Machine onboarding and optimization campaigns
+
+The dependency-free development CLI implements the first multi-architecture
+onboarding loop. Generated plans, platform drafts, research results, and
+campaign reports stay below ignored `build/sagectl/`:
+
+```sh
+make tool-test metadata-check
+./tools/sagectl doctor --gpu 4 --require-idle --force
+./tools/sagectl plan --workload ordered-interval-dense-s35-h1-d128
+./tools/sagectl baseline --gpu 4 \
+  --platform r9700-gfx1201-rocm7.2.3-ubuntu24.04 \
+  --workload ordered-interval-dense-s35-h1-d128
+./tools/sagectl search --gpu 4 \
+  --campaign gfx1201-ordered-interval-d128-smoke
+./tools/sagectl report \
+  --campaign gfx1201-ordered-interval-d128-smoke
+```
+
+Replace physical GPU `4` with a device that has been checked as idle. The
+`baseline` command also accepts a doctor-generated platform record through
+`--platform-draft build/sagectl/platforms/<platform-id>.json`; on a new GFX
+target it emits a matching exact-kernel draft for review. Architecture objects
+are isolated under `build/sagectl/architectures/<gfx>/`.
+
+The current registered campaign validates comparisons between existing kernels;
+compile-time candidate generation remains future work. See the
+[multi-architecture optimization playbook](doc/multi-architecture-optimization-playbook.md)
+for evidence and promotion boundaries.
+
 ## API lifecycle
 
 New consumers should use the experimental generic API in
@@ -227,6 +257,7 @@ The longer-term sequence is maintained in [`ROADMAP.md`](ROADMAP.md).
 - [H3 VDN integration](doc/h3-vdn-integration.md)
 - [Architecture and dispatch boundaries](doc/architecture.md)
 - [Benchmark protocol](doc/benchmarking.md)
+- [Multi-architecture optimization playbook](doc/multi-architecture-optimization-playbook.md)
 - [Support and compatibility policy](doc/support-policy.md)
 - [Generic interval-plan API](doc/generic-interval-plan-api.md)
 - [Changelog](CHANGELOG.md)

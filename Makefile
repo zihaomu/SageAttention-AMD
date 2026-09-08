@@ -10,19 +10,24 @@ CXXFLAGS := -std=c++17 -O3 -g -MMD -MP -Wall -Wextra -Wpedantic \
 	-Wshadow -Wconversion -Wno-sign-conversion $(HIP_FLAGS)
 LDLIBS := -lamdhip64
 
-BUILD_DIR := build
+BUILD_DIR ?= build
 LIB_OBJECTS := $(BUILD_DIR)/sage_attention.o \
 	$(BUILD_DIR)/h3_vdn_sage.o \
-	$(BUILD_DIR)/h3_vdn_sage_gfx12.o
+	$(BUILD_DIR)/h3_vdn_sage_gfx12.o \
+	$(BUILD_DIR)/sage_attention_portable_reference.o
 LIBRARY := $(BUILD_DIR)/libsageattention_amd.a
 TEST_BINS := $(BUILD_DIR)/test_contract $(BUILD_DIR)/test_gpu
+BENCH_BINS := $(BUILD_DIR)/bench_h3_vdn $(BUILD_DIR)/bench_interval
 
-.PHONY: all test metadata-check contract-test gpu-test bench isa clean
+.PHONY: all test metadata-check tool-test contract-test gpu-test bench isa clean
 
-all: $(LIBRARY) $(TEST_BINS) $(BUILD_DIR)/bench_h3_vdn
+all: $(LIBRARY) $(TEST_BINS) $(BENCH_BINS)
 
 metadata-check:
 	$(PYTHON) tools/validate_registry.py
+
+tool-test:
+	$(PYTHON) tests/test_sagectl.py
 
 $(BUILD_DIR):
 	mkdir -p $@
@@ -35,6 +40,11 @@ $(BUILD_DIR)/h3_vdn_sage.o: src/h3_vdn_sage.cpp | $(BUILD_DIR)
 
 $(BUILD_DIR)/h3_vdn_sage_gfx12.o: src/h3_vdn_sage_gfx12.hip | $(BUILD_DIR)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(SAGE_AMDGPU_FLAGS) -x hip -c $< -o $@
+
+$(BUILD_DIR)/sage_attention_portable_reference.o: \
+		src/sage_attention_portable_reference.hip \
+		src/sage_attention_portable_reference.hpp | $(BUILD_DIR)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -x hip -c $< -o $@
 
 $(LIBRARY): $(LIB_OBJECTS)
 	$(AR) rcs $@ $^
@@ -50,6 +60,11 @@ $(BUILD_DIR)/test_gpu: tests/test_gpu.cpp \
 		$(LDLIBS) -o $@
 
 $(BUILD_DIR)/bench_h3_vdn: tests/bench_h3_vdn.cpp \
+		$(LIBRARY)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< -L$(BUILD_DIR) -lsageattention_amd \
+		$(LDLIBS) -o $@
+
+$(BUILD_DIR)/bench_interval: tests/bench_interval.cpp \
 		$(LIBRARY)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< -L$(BUILD_DIR) -lsageattention_amd \
 		$(LDLIBS) -o $@
@@ -84,6 +99,6 @@ isa: $(BUILD_DIR)/h3_vdn_sage_gfx12.s
 
 clean:
 	rm -f $(BUILD_DIR)/*.o $(BUILD_DIR)/*.d $(BUILD_DIR)/*.a $(BUILD_DIR)/*.s \
-		$(TEST_BINS) $(BUILD_DIR)/bench_h3_vdn
+		$(TEST_BINS) $(BENCH_BINS)
 
 -include $(BUILD_DIR)/*.d

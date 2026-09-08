@@ -11,6 +11,10 @@ usernames, serial numbers, or transient device indices.
 - `workloads/`: benchmark shapes and attention-mask semantics;
 - `../benchmarks/results/`: measured sessions joining the three IDs above.
 
+Optimization definitions live under `../benchmarks/campaigns/`. They bind
+registry records to a bounded search and stopping policy, but are not evidence
+until a reviewed result is added under `../benchmarks/results/`.
+
 JSON is used so CI and reporting tools can consume the data without an extra
 parser dependency. Run `make metadata-check` after editing any record.
 

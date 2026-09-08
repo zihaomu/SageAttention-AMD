@@ -387,12 +387,6 @@ __global__ __launch_bounds__(64) void interval_sage_i8_bf16_gfx12_kernel(
 }
 
 
-bool is_gfx12_device(const hipDeviceProp_t &properties) {
-    return properties.warpSize == 32 &&
-           (std::strncmp(properties.gcnArchName, "gfx1200", 7) == 0 ||
-            std::strncmp(properties.gcnArchName, "gfx1201", 7) == 0);
-}
-
 }  // namespace
 
 namespace sageattention {
@@ -400,13 +394,18 @@ namespace sageattention {
 hipError_t query_support(const descriptor &operation) {
     const hipError_t descriptor_error = validate_descriptor(operation);
     if (descriptor_error != hipSuccess) return descriptor_error;
+    const kernel_registration *registration =
+        resolve_kernel_registration(operation);
+    if (!registration) return hipErrorNotSupported;
     int device = 0;
     hipError_t error = hipGetDevice(&device);
     if (error != hipSuccess) return error;
     hipDeviceProp_t properties = {};
     error = hipGetDeviceProperties(&properties, device);
     if (error != hipSuccess) return error;
-    return is_gfx12_device(properties) ? hipSuccess : hipErrorNotSupported;
+    return device_matches_registration(*registration, properties)
+               ? hipSuccess
+               : hipErrorNotSupported;
 }
 
 hipError_t launch(const params &operation_params,
@@ -454,6 +453,10 @@ static hipError_t launch_prepared_impl(const params &operation_params,
     const hipError_t descriptor_error =
         validate_descriptor(operation_params.operation);
     if (descriptor_error != hipSuccess) return descriptor_error;
+    const kernel_registration *registration =
+        resolve_kernel_registration(operation_params.operation);
+    if (!registration || registration->id != kernel_id::e27_gfx12_d128)
+        return hipErrorNotSupported;
     workspace_layout layout_result = {};
     if (!make_workspace_layout(operation_params.operation, &layout_result) ||
         operation_params.workspace_bytes < layout_result.bytes)
@@ -465,7 +468,8 @@ static hipError_t launch_prepared_impl(const params &operation_params,
     hipDeviceProp_t properties = {};
     error = hipGetDeviceProperties(&properties, device);
     if (error != hipSuccess) return error;
-    if (!is_gfx12_device(properties)) return hipErrorNotSupported;
+    if (!device_matches_registration(*registration, properties))
+        return hipErrorNotSupported;
     if (layout_result.task_count >
             static_cast<std::size_t>(properties.maxGridSize[0]) ||
         layout_result.q_groups >

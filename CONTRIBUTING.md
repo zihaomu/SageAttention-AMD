@@ -53,6 +53,18 @@ Results live in `benchmarks/results/` and refer to stable platform, kernel, and
 workload IDs. Follow [the benchmark protocol](doc/benchmarking.md). Historical
 results are append-only.
 
+## Adding an optimization campaign
+
+Create `benchmarks/campaigns/<campaign-id>.json` after its platform, exact
+baseline, candidate kernels, and workloads exist. State the hypothesis,
+objective, search space, gates, acceptance threshold, and stopping rule. Run
+`make metadata-check`, then execute the campaign on an explicitly selected idle
+GPU with `./tools/sagectl search --gpu <index> --campaign <campaign-id>`.
+
+Generated trials and reports under `build/sagectl/` are research artifacts.
+Do not copy one into `benchmarks/results/` until the source commit is clean and
+the benchmark evidence requirements are satisfied.
+
 ## Required checks
 
 Metadata and documentation:
