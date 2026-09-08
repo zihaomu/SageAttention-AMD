@@ -1,4 +1,5 @@
 #include "h3_vdn_sage.hpp"
+#include "sage_attention.hpp"
 
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
@@ -51,6 +52,47 @@ std::uint64_t hash_bf16(const std::vector<hip_bfloat16> &values) {
         hash *= UINT64_C(1099511628211);
     }
     return hash;
+}
+
+sageattention::descriptor generic_descriptor(
+    const h3_vdn_sage_geometry &geometry,
+    std::size_t task_count) {
+    return {{1, geometry.sequence, geometry.sequence, geometry.heads,
+             geometry.heads, geometry.head_dim, sageattention::layout::nhd},
+            {sageattention::data_type::bf16,
+             sageattention::data_type::bf16,
+             sageattention::qk_mode::symmetric_i8,
+             sageattention::pv_mode::bf16,
+             sageattention::kernel_id::automatic_select},
+            task_count};
+}
+
+std::vector<sageattention::q_task> build_generic_tasks(
+    const h3_vdn_sage_geometry &geometry) {
+    std::vector<h3_vdn_q_task> h3_tasks(
+        h3_vdn_sage_task_count(geometry));
+    std::size_t built = 0;
+    if (h3_vdn_sage_build_tasks(geometry, h3_tasks.data(), h3_tasks.size(),
+                                &built) != hipSuccess ||
+        built != h3_tasks.size()) {
+        return {};
+    }
+    std::vector<sageattention::q_task> result(h3_tasks.size());
+    for (std::size_t task_index = 0; task_index < h3_tasks.size();
+         ++task_index) {
+        result[task_index].q_begin = h3_tasks[task_index].q_begin;
+        result[task_index].q_count = h3_tasks[task_index].q_count;
+        result[task_index].interval_count =
+            h3_tasks[task_index].interval_count;
+        for (std::uint32_t interval_index = 0;
+             interval_index < h3_tasks[task_index].interval_count;
+             ++interval_index) {
+            result[task_index].allowed[interval_index] = {
+                h3_tasks[task_index].allowed[interval_index].begin,
+                h3_tasks[task_index].allowed[interval_index].end};
+        }
+    }
+    return result;
 }
 
 std::vector<float> cpu_attention(
@@ -144,7 +186,147 @@ bool run_operator(const h3_vdn_sage_geometry &g,
                              hipMemcpyDeviceToHost, stream));
     HIP_CHECK(hipStreamSynchronize(stream));
     CHECK(std::memcmp(output->data(), repeat.data(), tensor_bytes) == 0);
+
+    std::vector<sageattention::q_task> generic_tasks =
+        build_generic_tasks(g);
+    CHECK(!generic_tasks.empty());
+    const sageattention::descriptor operation =
+        generic_descriptor(g, generic_tasks.size());
+    const sageattention::interval_plan plan = {
+        generic_tasks.data(), generic_tasks.size()};
+    CHECK(sageattention::query_support(operation) == hipSuccess);
+    CHECK(sageattention::workspace_size(operation) == workspace_bytes);
+    const sageattention::params generic_params = {
+        dq.data,
+        dk.data,
+        dv.data,
+        dout.data,
+        operation,
+        1.0f / std::sqrt(static_cast<float>(g.head_dim)),
+        workspace.data,
+        workspace_bytes,
+        stream};
+    HIP_CHECK(sageattention::prepare_workspace(
+        operation, plan, workspace.data, workspace_bytes, stream));
+    HIP_CHECK(sageattention::launch_prepared(generic_params));
+    std::vector<hip_bfloat16> generic_output(output->size());
+    HIP_CHECK(hipMemcpyAsync(generic_output.data(), dout.data, tensor_bytes,
+                             hipMemcpyDeviceToHost, stream));
+    HIP_CHECK(hipStreamSynchronize(stream));
+    CHECK(std::memcmp(output->data(), generic_output.data(), tensor_bytes) ==
+          0);
     HIP_CHECK(hipStreamDestroy(stream));
+    return true;
+}
+
+bool run_generic_operator(
+    const sageattention::descriptor &operation,
+    const sageattention::interval_plan &plan,
+    const std::vector<hip_bfloat16> &query,
+    const std::vector<hip_bfloat16> &key,
+    const std::vector<hip_bfloat16> &value,
+    std::vector<hip_bfloat16> *output) {
+    const std::size_t tensor_bytes = query.size() * sizeof(query[0]);
+    const std::size_t workspace_bytes =
+        sageattention::workspace_size(operation);
+    CHECK(workspace_bytes > 0 && output && output->size() == query.size() &&
+          key.size() == query.size() && value.size() == query.size());
+    device_buffer dq, dk, dv, dout, workspace;
+    CHECK(dq.allocate(tensor_bytes) && dk.allocate(tensor_bytes) &&
+          dv.allocate(tensor_bytes) && dout.allocate(tensor_bytes) &&
+          workspace.allocate(workspace_bytes));
+    hipStream_t stream = nullptr;
+    HIP_CHECK(hipStreamCreate(&stream));
+    HIP_CHECK(hipMemcpyAsync(dq.data, query.data(), tensor_bytes,
+                             hipMemcpyHostToDevice, stream));
+    HIP_CHECK(hipMemcpyAsync(dk.data, key.data(), tensor_bytes,
+                             hipMemcpyHostToDevice, stream));
+    HIP_CHECK(hipMemcpyAsync(dv.data, value.data(), tensor_bytes,
+                             hipMemcpyHostToDevice, stream));
+    const sageattention::params params = {
+        dq.data,
+        dk.data,
+        dv.data,
+        dout.data,
+        operation,
+        1.0f / std::sqrt(
+                   static_cast<float>(operation.shape.head_dimension)),
+        workspace.data,
+        workspace_bytes,
+        stream};
+    HIP_CHECK(sageattention::launch(params, plan));
+    HIP_CHECK(hipMemcpyAsync(output->data(), dout.data, tensor_bytes,
+                             hipMemcpyDeviceToHost, stream));
+    HIP_CHECK(hipStreamSynchronize(stream));
+
+    std::vector<hip_bfloat16> repeat(output->size());
+    HIP_CHECK(sageattention::launch_prepared(params));
+    HIP_CHECK(hipMemcpyAsync(repeat.data(), dout.data, tensor_bytes,
+                             hipMemcpyDeviceToHost, stream));
+    HIP_CHECK(hipStreamSynchronize(stream));
+    CHECK(std::memcmp(output->data(), repeat.data(), tensor_bytes) == 0);
+    HIP_CHECK(hipStreamDestroy(stream));
+    return true;
+}
+
+bool test_manual_generic_interval_plan() {
+    const sageattention::q_task tasks[] = {
+        {0, 10, 2, {{0, 5}, {20, 35}}},
+        {10, 22, 1, {{4, 17}}},
+        {32, 3, 1, {{0, 35}}},
+    };
+    const sageattention::descriptor operation = {
+        {1, 35, 35, 1, 1, 128, sageattention::layout::nhd},
+        {sageattention::data_type::bf16,
+         sageattention::data_type::bf16,
+         sageattention::qk_mode::symmetric_i8,
+         sageattention::pv_mode::bf16,
+         sageattention::kernel_id::automatic_select},
+        3};
+    const sageattention::interval_plan plan = {tasks, 3};
+    CHECK(sageattention::validate_interval_plan(operation, plan) ==
+          hipSuccess);
+
+    const std::size_t elements = static_cast<std::size_t>(35) * 128;
+    std::vector<hip_bfloat16> query(elements, hip_bfloat16(0.0f));
+    std::vector<hip_bfloat16> key(elements, hip_bfloat16(0.0f));
+    std::vector<hip_bfloat16> value(elements);
+    for (std::size_t index = 0; index < elements; ++index) {
+        const int centered = static_cast<int>((index * 17) % 59) - 29;
+        value[index] = hip_bfloat16(static_cast<float>(centered) * 0.015f);
+    }
+    std::vector<hip_bfloat16> output(elements);
+    CHECK(run_generic_operator(operation, plan, query, key, value, &output));
+
+    float max_absolute = 0.0f;
+    for (std::uint32_t query_row = 0; query_row < 35; ++query_row) {
+        std::uint32_t allowed_count = 0;
+        for (std::uint32_t key_row = 0; key_row < 35; ++key_row)
+            if (sageattention::key_allowed(operation, plan, query_row,
+                                           key_row))
+                ++allowed_count;
+        CHECK(allowed_count > 0);
+        for (std::uint32_t dimension = 0; dimension < 128; ++dimension) {
+            float expected = 0.0f;
+            for (std::uint32_t key_row = 0; key_row < 35; ++key_row) {
+                if (!sageattention::key_allowed(operation, plan, query_row,
+                                                key_row))
+                    continue;
+                expected += static_cast<float>(
+                    value[static_cast<std::size_t>(key_row) * 128 +
+                          dimension]);
+            }
+            expected /= static_cast<float>(allowed_count);
+            const float observed = static_cast<float>(
+                output[static_cast<std::size_t>(query_row) * 128 +
+                       dimension]);
+            CHECK(std::isfinite(observed));
+            max_absolute =
+                std::max(max_absolute, std::fabs(observed - expected));
+        }
+    }
+    std::printf("generic manual intervals: max_abs=%.7g\n", max_absolute);
+    CHECK(max_absolute < 0.005f);
     return true;
 }
 
@@ -498,12 +680,14 @@ int main() {
         return EXIT_FAILURE;
     }
     if (!test_uniform_scores_is_masked_mean() ||
+        !test_manual_generic_interval_plan() ||
         !test_correctness_and_determinism() ||
         !test_h3_17_frame_misaligned_geometry() ||
         !test_targeted_h3_geometries() ||
         !test_output_and_workspace_guards() ||
         !test_masked_key_and_value_do_not_leak())
         return EXIT_FAILURE;
-    std::puts("gfx12 INT8 QK + BF16 PV VDN SageAttention tests passed");
+    std::puts("gfx12 INT8 QK + BF16 PV generic/H3 SageAttention tests "
+              "passed");
     return EXIT_SUCCESS;
 }

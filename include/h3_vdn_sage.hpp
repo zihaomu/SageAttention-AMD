@@ -6,11 +6,11 @@
 #include <cstddef>
 #include <cstdint>
 
-/* v0.1 ships the first SageAttention-AMD specialization: the sparse interval
- * layout used by H3 VDN. The API owns no device memory and has no dependency
- * on H3 tensor types; callers provide raw device pointers, a HIP stream, and
- * reusable workspace. The public API is experimental until the generic
- * interval-plan interface is finalized. */
+/* Source-compatible v0.1 H3 VDN adapter. It builds the model-independent
+ * interval plan declared in sage_attention.hpp and dispatches the same E27
+ * specialization. The API owns no device memory and has no dependency on H3
+ * tensor types; callers provide raw device pointers, a HIP stream, and reusable
+ * workspace. New integrations should use the generic API directly. */
 
 enum class h3_vdn_sage_pv_mode : std::uint32_t {
     bf16 = 0,

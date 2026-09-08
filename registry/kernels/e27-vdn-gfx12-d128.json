@@ -3,6 +3,8 @@
   "kernel_id": "e27-vdn-gfx12-d128",
   "status": "experimental",
   "implementation": {
+    "generic_api": "include/sage_attention.hpp",
+    "generic_host": "src/sage_attention.cpp",
     "api": "include/h3_vdn_sage.hpp",
     "host": "src/h3_vdn_sage.cpp",
     "device": "src/h3_vdn_sage_gfx12.hip"
@@ -28,7 +30,7 @@
       "bf16"
     ],
     "mask_plan_classes": [
-      "h3-vdn-interval-v1"
+      "ordered-interval-v1"
     ]
   },
   "algorithm": {
@@ -54,11 +56,13 @@
     "guard_canaries": "pass",
     "determinism": "pass",
     "isa": "pass",
+    "generic_manual_interval_plan": "pass",
+    "generic_h3_bitwise_parity": "pass",
     "downstream_h3_audio_gate": "fail-0-of-3"
   },
   "limitations": [
     "Explicit selection only; not an H3 automatic default.",
     "FP16 and FP8 API modes are reserved and unsupported.",
-    "The current public planner is H3 VDN-specific pending the generic plan API."
+    "The E27 plan ABI accepts at most 32 query rows and 5 key intervals per task."
   ]
 }

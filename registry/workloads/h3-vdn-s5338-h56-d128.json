@@ -13,7 +13,8 @@
     "output_dtype": "bf16"
   },
   "mask": {
-    "plan_class": "h3-vdn-interval-v1",
+    "plan_class": "ordered-interval-v1",
+    "planner": "h3-vdn-v1",
     "video_start": 986,
     "frames": 17,
     "tokens_per_frame": 256,

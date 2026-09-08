@@ -6,7 +6,8 @@ benchmark records are the source of truth.
 ## Foundation
 
 - Stabilize platform, kernel, workload, and benchmark metadata contracts.
-- Extract a generic interval-task plan API from the first H3 VDN adapter.
+- Stabilize the initial generic interval-task plan API now used by the H3 VDN
+  adapter.
 - Add an explicit dispatcher keyed by architecture, wave size, layout, data
   type, head dimension, mask-plan class, and numerical mode.
 - Keep experimental and supported status visible in API and registry data.

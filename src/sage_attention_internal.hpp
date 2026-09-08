@@ -1,11 +1,13 @@
-#ifndef H3_VDN_SAGE_INTERNAL_HPP
-#define H3_VDN_SAGE_INTERNAL_HPP
+#ifndef SAGE_ATTENTION_INTERNAL_HPP
+#define SAGE_ATTENTION_INTERNAL_HPP
 
-#include "h3_vdn_sage.hpp"
+#include "sage_attention.hpp"
 
 #include <cstddef>
 
-struct h3_vdn_sage_workspace_layout {
+namespace sageattention {
+
+struct workspace_layout {
     std::size_t q_i8_offset;
     std::size_t k_i8_offset;
     std::size_t q_scale_offset;
@@ -17,9 +19,10 @@ struct h3_vdn_sage_workspace_layout {
     std::size_t bytes;
 };
 
-bool h3_vdn_sage_make_workspace_layout(
-    const h3_vdn_sage_geometry &geometry,
-    h3_vdn_sage_pv_mode mode,
-    h3_vdn_sage_workspace_layout *layout);
+bool make_workspace_layout(
+    const descriptor &operation,
+    workspace_layout *result);
+
+}  // namespace sageattention
 
 #endif

@@ -1,4 +1,5 @@
 #include "h3_vdn_sage.hpp"
+#include "sage_attention.hpp"
 
 #include <cfenv>
 #include <cmath>
@@ -53,6 +54,40 @@ bool scalar_allowed(const h3_vdn_sage_geometry &g, std::uint32_t query,
                                 : static_cast<std::uint32_t>(end);
     }
     return kf >= lower && kf <= upper;
+}
+
+sageattention::descriptor generic_descriptor(
+    const h3_vdn_sage_geometry &geometry,
+    std::size_t task_count,
+    sageattention::kernel_id kernel =
+        sageattention::kernel_id::e27_gfx12_d128) {
+    return {{1, geometry.sequence, geometry.sequence, geometry.heads,
+             geometry.heads, geometry.head_dim, sageattention::layout::nhd},
+            {sageattention::data_type::bf16,
+             sageattention::data_type::bf16,
+             sageattention::qk_mode::symmetric_i8,
+             sageattention::pv_mode::bf16, kernel},
+            task_count};
+}
+
+std::vector<sageattention::q_task> generic_tasks_from_h3(
+    const std::vector<h3_vdn_q_task> &h3_tasks) {
+    std::vector<sageattention::q_task> result(h3_tasks.size());
+    for (std::size_t task_index = 0; task_index < h3_tasks.size();
+         ++task_index) {
+        result[task_index].q_begin = h3_tasks[task_index].q_begin;
+        result[task_index].q_count = h3_tasks[task_index].q_count;
+        result[task_index].interval_count =
+            h3_tasks[task_index].interval_count;
+        for (std::uint32_t interval_index = 0;
+             interval_index < h3_tasks[task_index].interval_count;
+             ++interval_index) {
+            result[task_index].allowed[interval_index] = {
+                h3_tasks[task_index].allowed[interval_index].begin,
+                h3_tasks[task_index].allowed[interval_index].end};
+        }
+    }
+    return result;
 }
 
 bool check_geometry(const h3_vdn_sage_geometry &g) {
@@ -140,6 +175,85 @@ bool test_quantization_contract() {
     CHECK(h3_vdn_sage_quantize_symmetric_i8(3.0f, 0.0f) == 0);
     CHECK(h3_vdn_sage_quantize_symmetric_i8(
               std::numeric_limits<float>::infinity(), 1.0f) == 0);
+    CHECK(sageattention::quantize_symmetric_i8(1.5f, 1.0f) == 2);
+    CHECK(sageattention::quantize_symmetric_i8(-999.0f, 1.0f) == -127);
+    return true;
+}
+
+bool test_generic_interval_plan() {
+    const h3_vdn_sage_geometry geometry = {
+        83, 2, 128, 11, 6, 9, 1, 2, true};
+    const std::size_t task_count = h3_vdn_sage_task_count(geometry);
+    std::vector<h3_vdn_q_task> h3_tasks(task_count);
+    std::size_t built = 0;
+    CHECK(h3_vdn_sage_build_tasks(geometry, h3_tasks.data(), h3_tasks.size(),
+                                  &built) == hipSuccess);
+    CHECK(built == task_count);
+    std::vector<sageattention::q_task> tasks =
+        generic_tasks_from_h3(h3_tasks);
+    const sageattention::descriptor operation =
+        generic_descriptor(geometry, task_count);
+    const sageattention::interval_plan plan = {tasks.data(), tasks.size()};
+    CHECK(sageattention::validate_descriptor(operation) == hipSuccess);
+    CHECK(sageattention::validate_interval_plan(operation, plan) ==
+          hipSuccess);
+    CHECK(sageattention::workspace_size(operation) ==
+          h3_vdn_sage_workspace_size(geometry,
+                                     h3_vdn_sage_pv_mode::bf16));
+
+    sageattention::descriptor automatic = operation;
+    automatic.options.kernel = sageattention::kernel_id::automatic_select;
+    CHECK(sageattention::validate_descriptor(automatic) == hipSuccess);
+    CHECK(sageattention::workspace_size(automatic) ==
+          sageattention::workspace_size(operation));
+
+    for (std::uint32_t query = 0; query < geometry.sequence; ++query) {
+        for (std::uint32_t key = 0; key < geometry.sequence; ++key) {
+            CHECK(sageattention::key_allowed(operation, plan, query, key) ==
+                  h3_vdn_sage_key_allowed(geometry, query, key));
+        }
+    }
+
+    const sageattention::interval_plan missing_tasks = {
+        nullptr, tasks.size()};
+    CHECK(sageattention::validate_interval_plan(operation, missing_tasks) ==
+          hipErrorInvalidValue);
+    const sageattention::interval_plan wrong_count = {
+        tasks.data(), tasks.size() - 1};
+    CHECK(sageattention::validate_interval_plan(operation, wrong_count) ==
+          hipErrorInvalidValue);
+
+    std::vector<sageattention::q_task> malformed = tasks;
+    malformed.front().q_begin = 1;
+    CHECK(sageattention::validate_interval_plan(
+              operation, {malformed.data(), malformed.size()}) ==
+          hipErrorInvalidValue);
+    malformed = tasks;
+    malformed.front().interval_count = 2;
+    malformed.front().allowed[0] = {0, 10};
+    malformed.front().allowed[1] = {9, 20};
+    CHECK(sageattention::validate_interval_plan(
+              operation, {malformed.data(), malformed.size()}) ==
+          hipErrorInvalidValue);
+    malformed = tasks;
+    malformed.front().allowed[0].end = geometry.sequence + 1;
+    CHECK(sageattention::validate_interval_plan(
+              operation, {malformed.data(), malformed.size()}) ==
+          hipErrorInvalidValue);
+
+    sageattention::descriptor unsupported = operation;
+    unsupported.shape.head_dimension = 64;
+    CHECK(sageattention::validate_descriptor(unsupported) ==
+          hipErrorNotSupported);
+    CHECK(sageattention::workspace_size(unsupported) == 0);
+    sageattention::descriptor invalid = operation;
+    invalid.shape.batch = 0;
+    CHECK(sageattention::validate_descriptor(invalid) ==
+          hipErrorInvalidValue);
+    invalid = operation;
+    invalid.task_count = 0;
+    CHECK(sageattention::validate_descriptor(invalid) ==
+          hipErrorInvalidValue);
     return true;
 }
 
@@ -175,8 +289,9 @@ bool test_validation_and_workspace() {
 
 int main() {
     if (!test_masks_and_tasks() || !test_quantization_contract() ||
-        !test_validation_and_workspace())
+        !test_generic_interval_plan() || !test_validation_and_workspace())
         return EXIT_FAILURE;
-    std::puts("VDN mask/task, INT8 rounding, validation and workspace passed");
+    std::puts("generic/H3 interval plans, INT8 rounding, validation and "
+              "workspace passed");
     return EXIT_SUCCESS;
 }

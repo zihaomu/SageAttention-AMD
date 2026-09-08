@@ -21,11 +21,18 @@ back when an explicit Sage request is unsupported.
 
 ## Adapter boundary
 
-The standalone library accepts raw device pointers and a caller-owned HIP
-stream/workspace. The H3 adapter is responsible for:
+The standalone library now exposes both the generic API in
+`include/sage_attention.hpp` and the source-compatible v0.1 API in
+`include/h3_vdn_sage.hpp`. The latter converts H3 VDN geometry into the generic
+ordered-interval plan and forwards to the same E27 dispatcher. Existing H3
+callers do not need source changes.
+
+Both APIs accept raw device pointers and a caller-owned HIP stream/workspace.
+The downstream H3 integration is responsible for:
 
 1. validating BF16 NHD tensors and non-overlapping output/value storage;
-2. converting the H3 geometry and `anchor_both` representation;
+2. converting model state into `h3_vdn_sage_geometry`, including
+   `anchor_both`;
 3. checking gfx12, wave32, and `D=128` before explicit dispatch;
 4. allocating and reusing workspace in the owning `h3_gpu` context;
 5. preparing immutable task metadata only on geometry cache misses;
@@ -43,6 +50,7 @@ H3 should retain context-owned state equivalent to:
 architecture and wave size
 Sage workspace pointer and allocated bytes
 prepared geometry/mode key
+prepared interval-plan identity/task count
 metadata-ready flag
 ```
 

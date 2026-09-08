@@ -6,15 +6,16 @@ Native C++17/HIP SageAttention kernels and sparse-attention planning for AMD
 GPUs. The project has no PyTorch, ATen, Triton, CUDA, or Python runtime
 dependency.
 
-> **Project status:** experimental. Version `0.1.0-experimental` ships one
-> production-shaped specialization for the H3 VDN interval-mask workload on
-> AMD gfx12. The repository is intended to grow into a model-independent AMD
-> SageAttention library without weakening its specialized kernels.
+> **Project status:** experimental. The latest release is
+> [`v0.1.0-experimental`](https://github.com/zihaomu/SageAttention-AMD/releases/tag/v0.1.0-experimental).
+> `main` is `0.2.0-dev` and adds a model-independent interval-plan API while
+> retaining the first H3 VDN specialization and compatibility API.
 
 ## What is implemented
 
 The current E27 specialization supports:
 
+- caller-provided ordered-interval plans independent of model geometry;
 - BF16 NHD input/output, batch 1, dynamic sequence/head count, `D=128`;
 - symmetric signed INT8 Q/K quantization with 32-row Q and 64-row K groups;
 - gfx12 wave32 `v_wmma_i32_16x16x16_iu8` QK;
@@ -30,7 +31,7 @@ FP16 and FP8 E4M3 enum values are reserved but return
 `hipErrorNotSupported`. Non-gfx12 devices, non-wave32 execution, and head
 dimensions other than 128 are rejected explicitly.
 
-## Why the first specialization mentions H3 VDN
+## Generic plan and the H3 VDN adapter
 
 The repository name describes the intended library scope. The first verified
 consumer is H3 VDN, whose attention mask is not plain dense or causal
@@ -38,11 +39,10 @@ attention. Keeping that workload as the initial specialization preserves the
 actual benchmark and quality evidence instead of claiming unsupported
 generality.
 
-The implementation is already independent of H3 tensor types: the public API
-accepts raw device pointers, a HIP stream, geometry, and caller-owned
-workspace. A future generic interval-plan API will separate model-specific
-planning from the kernel dispatcher; the current VDN planner will remain one
-adapter/profile. See [Generalization roadmap](#generalization-roadmap).
+The generic API accepts raw device pointers, a HIP stream, an operation
+descriptor, caller-owned workspace, and an ordered-interval plan. H3 geometry
+is converted into that plan by the compatibility adapter. The E27 hot kernel
+remains specialized and receives the same task layout as the v0.1 release.
 
 ## Capability and evidence model
 
@@ -61,8 +61,9 @@ mode. A measurement on one tuple is never treated as evidence for another.
 
 Run `make metadata-check` to validate references and compatibility. The current
 validated tuple is R9700/gfx1201 wave32 on ROCm 7.2.3 with the experimental E27
-VDN `D=128` specialization. Registry presence does not by itself mean a kernel
-is a stable default; status and downstream quality are recorded separately.
+ordered-interval `D=128` specialization and H3 VDN workload. Registry presence
+does not by itself mean a kernel is a stable default; status and downstream
+quality are recorded separately.
 
 ## Build
 
@@ -105,9 +106,22 @@ measurements.
 
 ## API lifecycle
 
-The experimental v0.1 API is declared in
-[`include/h3_vdn_sage.hpp`](include/h3_vdn_sage.hpp). Its `h3_vdn_` prefix
-identifies the first mask planner, not a dependency on the H3 runtime.
+New consumers should use the experimental generic API in
+[`include/sage_attention.hpp`](include/sage_attention.hpp):
+
+1. Construct a `descriptor` and canonical `interval_plan`.
+2. Call `validate_interval_plan()` and `query_support()`.
+3. Call `workspace_size()` and allocate caller-owned device workspace.
+4. On a plan cache miss, call `prepare_workspace()`.
+5. Reuse that metadata with `launch_prepared()`.
+6. Use `launch_profiled()` only for synchronous diagnostics.
+
+The detailed contract is in
+[the generic interval-plan API guide](doc/generic-interval-plan-api.md).
+
+The source-compatible v0.1 H3 adapter remains in
+[`include/h3_vdn_sage.hpp`](include/h3_vdn_sage.hpp). Existing callers retain
+the same lifecycle:
 
 1. Call `h3_vdn_sage_workspace_size()` for a geometry and mode.
 2. Allocate the returned number of device bytes in the caller context.
@@ -115,8 +129,9 @@ identifies the first mask planner, not a dependency on the H3 runtime.
 4. Reuse the prepared metadata with `h3_vdn_sage_launch_prepared()`.
 5. Use `h3_vdn_sage_launch_profiled()` only for synchronous diagnostics.
 
-`h3_vdn_sage_launch()` is a cold-path convenience function that prepares task
-metadata for every call. It should not be used in a multi-layer hot loop.
+`h3_vdn_sage_launch()` remains a cold-path convenience function. It builds a
+generic interval plan and prepares metadata for every call, so it should not be
+used in a multi-layer hot loop.
 
 All size computations are overflow checked. Explicit dispatch surfaces an
 unsupported architecture, mode, shape, or insufficient workspace rather than
@@ -172,7 +187,7 @@ must not be presented as model-level acceptance.
 
 ```text
 include/   experimental public C++/HIP API
-src/       workspace planner, quantization, and gfx12 E27 kernel
+src/       generic dispatch/workspace, H3 planner, and gfx12 E27 kernel
 tests/     CPU contracts, GPU correctness/canaries, benchmark
 doc/       requirements, optimization ledger, decisions, H3 integration
 registry/  platform, kernel, and workload capability records
@@ -188,7 +203,7 @@ excluded from version control.
 The public project can become model-independent without turning the E27 hot
 kernel into a branch-heavy generic kernel:
 
-1. Introduce a generic interval-task plan API independent of VDN geometry.
+1. Stabilize the new generic interval-task plan API independent of VDN geometry.
 2. Keep the current H3 VDN geometry-to-interval conversion as an integration
    adapter and reference sparse-mask planner.
 3. Dispatch to specialized kernels by architecture, head dimension, input
@@ -213,6 +228,8 @@ The longer-term sequence is maintained in [`ROADMAP.md`](ROADMAP.md).
 - [Architecture and dispatch boundaries](doc/architecture.md)
 - [Benchmark protocol](doc/benchmarking.md)
 - [Support and compatibility policy](doc/support-policy.md)
+- [Generic interval-plan API](doc/generic-interval-plan-api.md)
+- [Changelog](CHANGELOG.md)
 
 ## Contributing
 

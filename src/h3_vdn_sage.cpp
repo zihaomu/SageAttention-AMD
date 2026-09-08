@@ -1,22 +1,14 @@
 #include "h3_vdn_sage.hpp"
-#include "h3_vdn_sage_internal.hpp"
+#include "sage_attention.hpp"
 
 #include <algorithm>
-#include <cmath>
 #include <cstdint>
-#include <cstring>
 #include <limits>
+#include <vector>
 
 namespace {
 
-constexpr std::size_t kWorkspaceAlignment = 256;
 constexpr std::uint32_t kQTileRows = 32;
-
-bool checked_add(std::size_t a, std::size_t b, std::size_t *result) {
-    if (a > std::numeric_limits<std::size_t>::max() - b) return false;
-    *result = a + b;
-    return true;
-}
 
 bool checked_mul(std::size_t a, std::size_t b, std::size_t *result) {
     if (a && b > std::numeric_limits<std::size_t>::max() / a) return false;
@@ -24,12 +16,11 @@ bool checked_mul(std::size_t a, std::size_t b, std::size_t *result) {
     return true;
 }
 
-bool checked_align(std::size_t value, std::size_t alignment,
-                   std::size_t *result) {
-    std::size_t widened;
-    if (!checked_add(value, alignment - 1, &widened)) return false;
-    *result = widened & ~(alignment - 1);
-    return true;
+std::size_t sized_task_count(const h3_vdn_sage_geometry &geometry) {
+    std::size_t elements = 0;
+    if (!checked_mul(geometry.sequence, geometry.heads, &elements) ||
+        !checked_mul(elements, geometry.head_dim, &elements)) return 0;
+    return h3_vdn_sage_task_count(geometry);
 }
 
 std::uint64_t video_end_wide(const h3_vdn_sage_geometry &geometry) {
@@ -187,6 +178,48 @@ std::size_t visit_tasks(const h3_vdn_sage_geometry &geometry, Emit emit) {
     return count;
 }
 
+sageattention::descriptor make_generic_descriptor(
+    const h3_vdn_sage_geometry &geometry,
+    h3_vdn_sage_pv_mode mode,
+    std::size_t task_count) {
+    return {
+        {1, geometry.sequence, geometry.sequence, geometry.heads,
+         geometry.heads, geometry.head_dim, sageattention::layout::nhd},
+        {sageattention::data_type::bf16, sageattention::data_type::bf16,
+         sageattention::qk_mode::symmetric_i8,
+         static_cast<sageattention::pv_mode>(
+             static_cast<std::uint32_t>(mode)),
+         sageattention::kernel_id::e27_gfx12_d128},
+        task_count};
+}
+
+sageattention::q_task make_generic_task(const h3_vdn_q_task &source) {
+    sageattention::q_task result = {};
+    result.q_begin = source.q_begin;
+    result.q_count = source.q_count;
+    result.interval_count = source.interval_count;
+    for (std::uint32_t index = 0; index < source.interval_count; ++index) {
+        result.allowed[index] = {source.allowed[index].begin,
+                                 source.allowed[index].end};
+    }
+    return result;
+}
+
+sageattention::params make_generic_params(
+    const h3_vdn_sage_params &source) {
+    return {source.query_bf16,
+            source.key_bf16,
+            source.value_bf16,
+            source.output_bf16,
+            make_generic_descriptor(
+                source.geometry, source.pv_mode,
+                sized_task_count(source.geometry)),
+            source.scale,
+            source.workspace,
+            source.workspace_bytes,
+            source.stream};
+}
+
 }  // namespace
 
 hipError_t h3_vdn_sage_validate_geometry(
@@ -245,66 +278,80 @@ hipError_t h3_vdn_sage_build_tasks(
 }
 
 std::int8_t h3_vdn_sage_quantize_symmetric_i8(float value, float scale) {
-    if (!(scale > 0.0f) || !std::isfinite(scale) || !std::isfinite(value))
-        return 0;
-    const float clipped =
-        std::max(-127.0f, std::min(127.0f, value / scale));
-    return static_cast<std::int8_t>(std::nearbyint(clipped));
-}
-
-bool h3_vdn_sage_make_workspace_layout(
-    const h3_vdn_sage_geometry &geometry,
-    h3_vdn_sage_pv_mode mode,
-    h3_vdn_sage_workspace_layout *layout) {
-    if (!layout || mode != h3_vdn_sage_pv_mode::bf16 ||
-        h3_vdn_sage_validate_geometry(geometry) != hipSuccess) {
-        return false;
-    }
-    h3_vdn_sage_workspace_layout result = {};
-    result.q_groups = (static_cast<std::size_t>(geometry.sequence) + 31) / 32;
-    result.k_groups = (static_cast<std::size_t>(geometry.sequence) + 63) / 64;
-
-    std::size_t elements;
-    if (!checked_mul(geometry.sequence, geometry.heads, &elements) ||
-        !checked_mul(elements, geometry.head_dim, &elements)) return false;
-    result.task_count = h3_vdn_sage_task_count(geometry);
-
-    std::size_t cursor = 0;
-    result.q_i8_offset = cursor;
-    if (!checked_add(cursor, elements, &cursor) ||
-        !checked_align(cursor, kWorkspaceAlignment, &cursor)) return false;
-    result.k_i8_offset = cursor;
-    if (!checked_add(cursor, elements, &cursor) ||
-        !checked_align(cursor, kWorkspaceAlignment, &cursor)) return false;
-
-    std::size_t scale_elements;
-    std::size_t scale_bytes;
-    result.q_scale_offset = cursor;
-    if (!checked_mul(geometry.heads, result.q_groups, &scale_elements) ||
-        !checked_mul(scale_elements, sizeof(float), &scale_bytes) ||
-        !checked_add(cursor, scale_bytes, &cursor) ||
-        !checked_align(cursor, kWorkspaceAlignment, &cursor)) return false;
-    result.k_scale_offset = cursor;
-    if (!checked_mul(geometry.heads, result.k_groups, &scale_elements) ||
-        !checked_mul(scale_elements, sizeof(float), &scale_bytes) ||
-        !checked_add(cursor, scale_bytes, &cursor) ||
-        !checked_align(cursor, kWorkspaceAlignment, &cursor)) return false;
-
-    std::size_t task_bytes;
-    result.tasks_offset = cursor;
-    if (!checked_mul(result.task_count, sizeof(h3_vdn_q_task), &task_bytes) ||
-        !checked_add(cursor, task_bytes, &cursor) ||
-        !checked_align(cursor, kWorkspaceAlignment, &cursor)) return false;
-    result.bytes = cursor;
-    *layout = result;
-    return true;
+    return sageattention::quantize_symmetric_i8(value, scale);
 }
 
 std::size_t h3_vdn_sage_workspace_size(
     const h3_vdn_sage_geometry &geometry,
     h3_vdn_sage_pv_mode mode) {
-    h3_vdn_sage_workspace_layout layout = {};
-    return h3_vdn_sage_make_workspace_layout(geometry, mode, &layout)
-               ? layout.bytes
-               : 0;
+    if (h3_vdn_sage_validate_geometry(geometry) != hipSuccess) return 0;
+    return sageattention::workspace_size(
+        make_generic_descriptor(geometry, mode, sized_task_count(geometry)));
+}
+
+hipError_t h3_vdn_sage_prepare_workspace(
+    const h3_vdn_sage_geometry &geometry,
+    h3_vdn_sage_pv_mode mode,
+    void *workspace,
+    std::size_t workspace_bytes,
+    hipStream_t stream) {
+    if (h3_vdn_sage_validate_geometry(geometry) != hipSuccess)
+        return hipErrorInvalidValue;
+    const std::size_t task_count = sized_task_count(geometry);
+    const sageattention::descriptor operation =
+        make_generic_descriptor(geometry, mode, task_count);
+    const hipError_t descriptor_error =
+        sageattention::validate_descriptor(operation);
+    if (descriptor_error != hipSuccess) return descriptor_error;
+
+    try {
+        std::vector<h3_vdn_q_task> h3_tasks(operation.task_count);
+        std::size_t built_count = 0;
+        hipError_t error = h3_vdn_sage_build_tasks(
+            geometry, h3_tasks.data(), h3_tasks.size(), &built_count);
+        if (error != hipSuccess || built_count != operation.task_count)
+            return hipErrorInvalidValue;
+        std::vector<sageattention::q_task> generic_tasks;
+        generic_tasks.reserve(h3_tasks.size());
+        for (const h3_vdn_q_task &task : h3_tasks)
+            generic_tasks.push_back(make_generic_task(task));
+        const sageattention::interval_plan plan = {
+            generic_tasks.data(), generic_tasks.size()};
+        return sageattention::prepare_workspace(
+            operation, plan, workspace, workspace_bytes, stream);
+    } catch (...) {
+        return hipErrorOutOfMemory;
+    }
+}
+
+hipError_t h3_vdn_sage_launch_prepared(const h3_vdn_sage_params &params) {
+    if (h3_vdn_sage_validate_geometry(params.geometry) != hipSuccess)
+        return hipErrorInvalidValue;
+    return sageattention::launch_prepared(make_generic_params(params));
+}
+
+hipError_t h3_vdn_sage_launch_profiled(
+    const h3_vdn_sage_params &params,
+    h3_vdn_sage_profile *profile) {
+    if (!profile) return hipErrorInvalidValue;
+    sageattention::profile generic_profile = {};
+    const hipError_t error = sageattention::launch_profiled(
+        make_generic_params(params), &generic_profile);
+    if (error == hipSuccess) {
+        profile->q_quant_ms = generic_profile.q_quant_ms;
+        profile->k_quant_ms = generic_profile.k_quant_ms;
+        profile->attention_ms = generic_profile.attention_ms;
+        profile->total_ms = generic_profile.total_ms;
+    } else {
+        *profile = {};
+    }
+    return error;
+}
+
+hipError_t h3_vdn_sage_launch(const h3_vdn_sage_params &params) {
+    const hipError_t prepare_error = h3_vdn_sage_prepare_workspace(
+        params.geometry, params.pv_mode, params.workspace,
+        params.workspace_bytes, params.stream);
+    if (prepare_error != hipSuccess) return prepare_error;
+    return h3_vdn_sage_launch_prepared(params);
 }

@@ -8,8 +8,10 @@ flattening fast kernels into one heavily branched implementation.
 
 1. **Consumer adapter** converts model semantics into a supported plan. H3 VDN
    is the first adapter, not the library boundary.
-2. **Plan representation** describes dense, causal, windowed, block, or ordered
-   interval work independently of model tensor types.
+2. **Plan representation** describes ordered key intervals for query-row tiles
+   independently of model tensor types. Dense, causal, and sliding-window
+   planners can all produce this representation; a block-plan representation
+   remains future work.
 3. **Dispatcher** selects a specialization from explicit runtime properties:
    GPU architecture, wave size, layout, data types, head dimension, mask-plan
    class, and numerical mode.
@@ -43,6 +45,14 @@ Support is a tuple, not a single GPU label:
 Each kernel registry entry declares a subset of this space. The dispatcher
 must fail clearly outside it. A new GPU or ROCm version requires validation,
 even when it shares the same GFX architecture.
+
+## Current interval-plan contract
+
+The v0.2 development API represents a plan as canonical `q_task` records. Each
+task covers consecutive query rows with one shared set of ordered,
+non-overlapping key intervals. The current E27 dispatcher accepts at most 32
+query rows and five intervals per task. H3 VDN is now a planner/adapter that
+produces these records; the device kernel has no H3 geometry dependency.
 
 ## Numerical policy
 

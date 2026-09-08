@@ -11,7 +11,8 @@ CXXFLAGS := -std=c++17 -O3 -g -MMD -MP -Wall -Wextra -Wpedantic \
 LDLIBS := -lamdhip64
 
 BUILD_DIR := build
-LIB_OBJECTS := $(BUILD_DIR)/h3_vdn_sage.o \
+LIB_OBJECTS := $(BUILD_DIR)/sage_attention.o \
+	$(BUILD_DIR)/h3_vdn_sage.o \
 	$(BUILD_DIR)/h3_vdn_sage_gfx12.o
 LIBRARY := $(BUILD_DIR)/libsageattention_amd.a
 TEST_BINS := $(BUILD_DIR)/test_contract $(BUILD_DIR)/test_gpu
@@ -25,6 +26,9 @@ metadata-check:
 
 $(BUILD_DIR):
 	mkdir -p $@
+
+$(BUILD_DIR)/sage_attention.o: src/sage_attention.cpp | $(BUILD_DIR)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/h3_vdn_sage.o: src/h3_vdn_sage.cpp | $(BUILD_DIR)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@

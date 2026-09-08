@@ -1,17 +1,17 @@
 /* SPDX-License-Identifier: Apache-2.0
  *
- * SageAttention-AMD E27 research kernel for AMD gfx12. The current v0.1
- * specialization implements the H3 VDN interval-mask workload.
+ * SageAttention-AMD E27 research kernel for AMD gfx12. The kernel consumes a
+ * model-independent ordered-interval plan; H3 VDN is the first planner.
  *
  * The raw gfx12 WMMA fragment packing was independently adapted from the
  * Apache-2.0 SageAttention gfx12 work at thu-ml/SageAttention PR #368,
  * commit 66f5e64c9e36084c863a4480e570069245e58f90. This version removes all
- * Torch dependencies, uses NHD-only H3 geometry, implements the VDN interval
- * mask, uses BF16 PV, and exposes a caller-owned stream/workspace API.
+ * Torch dependencies, uses raw NHD pointers and generic interval tasks,
+ * implements BF16 PV, and exposes a caller-owned stream/workspace API.
  */
 
-#include "h3_vdn_sage.hpp"
-#include "h3_vdn_sage_internal.hpp"
+#include "sage_attention.hpp"
+#include "sage_attention_internal.hpp"
 
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
@@ -19,7 +19,6 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
-#include <vector>
 
 namespace {
 
@@ -186,20 +185,20 @@ make_probability_fragment(u32x4 words, int lane) {
 }
 
 [[maybe_unused]] __device__ __forceinline__ bool key_in_interval(
-    const h3_vdn_key_interval &interval,
+    const sageattention::key_interval &interval,
     std::uint32_t key,
     std::uint32_t sequence) {
     return key < sequence && key >= interval.begin && key < interval.end;
 }
 
-__global__ __launch_bounds__(64) void vdn_sage_i8_bf16_gfx12_kernel(
+__global__ __launch_bounds__(64) void interval_sage_i8_bf16_gfx12_kernel(
     const std::int8_t *__restrict__ query,
     const std::int8_t *__restrict__ key,
     const hip_bfloat16 *__restrict__ value,
     hip_bfloat16 *__restrict__ output,
     const float *__restrict__ q_scales,
     const float *__restrict__ k_scales,
-    const h3_vdn_q_task *__restrict__ tasks,
+    const sageattention::q_task *__restrict__ tasks,
     std::uint32_t task_count,
     std::uint32_t sequence,
     std::uint32_t heads,
@@ -214,7 +213,7 @@ __global__ __launch_bounds__(64) void vdn_sage_i8_bf16_gfx12_kernel(
 #if defined(__gfx12__) || defined(__gfx1200__) || defined(__gfx1201__)
     const int wave = static_cast<int>(threadIdx.x >> 5);
     const int lane = static_cast<int>(threadIdx.x & 31);
-    const h3_vdn_q_task *__restrict__ task = tasks + task_index;
+    const sageattention::q_task *__restrict__ task = tasks + task_index;
     const std::uint32_t task_q_begin = task->q_begin;
     const std::uint32_t task_q_count = task->q_count;
     const std::uint32_t task_interval_count = task->interval_count;
@@ -249,7 +248,8 @@ __global__ __launch_bounds__(64) void vdn_sage_i8_bf16_gfx12_kernel(
 
     for (std::uint32_t interval_index = 0;
         interval_index < task_interval_count; ++interval_index) {
-        const h3_vdn_key_interval interval = task->allowed[interval_index];
+        const sageattention::key_interval interval =
+            task->allowed[interval_index];
         const std::uint64_t first_tile = interval.begin & ~15u;
         for (std::uint64_t key_tile_wide = first_tile;
              key_tile_wide < interval.end; key_tile_wide += kTile) {
@@ -395,64 +395,69 @@ bool is_gfx12_device(const hipDeviceProp_t &properties) {
 
 }  // namespace
 
-hipError_t h3_vdn_sage_launch(const h3_vdn_sage_params &params) {
-    const hipError_t prepare_error = h3_vdn_sage_prepare_workspace(
-        params.geometry, params.pv_mode, params.workspace,
-        params.workspace_bytes, params.stream);
-    if (prepare_error != hipSuccess) return prepare_error;
-    return h3_vdn_sage_launch_prepared(params);
+namespace sageattention {
+
+hipError_t query_support(const descriptor &operation) {
+    const hipError_t descriptor_error = validate_descriptor(operation);
+    if (descriptor_error != hipSuccess) return descriptor_error;
+    int device = 0;
+    hipError_t error = hipGetDevice(&device);
+    if (error != hipSuccess) return error;
+    hipDeviceProp_t properties = {};
+    error = hipGetDeviceProperties(&properties, device);
+    if (error != hipSuccess) return error;
+    return is_gfx12_device(properties) ? hipSuccess : hipErrorNotSupported;
 }
 
-hipError_t h3_vdn_sage_prepare_workspace(
-    const h3_vdn_sage_geometry &geometry,
-    h3_vdn_sage_pv_mode mode,
+hipError_t launch(const params &operation_params,
+                  const interval_plan &plan) {
+    const hipError_t prepare_error = prepare_workspace(
+        operation_params.operation, plan, operation_params.workspace,
+        operation_params.workspace_bytes, operation_params.stream);
+    if (prepare_error != hipSuccess) return prepare_error;
+    return launch_prepared(operation_params);
+}
+
+hipError_t prepare_workspace(
+    const descriptor &operation,
+    const interval_plan &plan,
     void *workspace_pointer,
     std::size_t workspace_bytes,
     hipStream_t stream) {
     if (!workspace_pointer) return hipErrorInvalidValue;
-    h3_vdn_sage_workspace_layout layout = {};
-    if (!h3_vdn_sage_make_workspace_layout(geometry, mode, &layout) ||
-        workspace_bytes < layout.bytes) {
-        return mode == h3_vdn_sage_pv_mode::bf16 ? hipErrorInvalidValue
-                                                  : hipErrorNotSupported;
-    }
-    try {
-        std::vector<h3_vdn_q_task> host_tasks(layout.task_count);
-        std::size_t built_count = 0;
-        hipError_t error = h3_vdn_sage_build_tasks(
-            geometry, host_tasks.data(), host_tasks.size(), &built_count);
-        if (error != hipSuccess || built_count != layout.task_count)
-            return hipErrorInvalidValue;
-        auto *workspace = static_cast<std::uint8_t *>(workspace_pointer);
-        auto *device_tasks = reinterpret_cast<h3_vdn_q_task *>(
-            workspace + layout.tasks_offset);
-        return hipMemcpyAsync(device_tasks, host_tasks.data(),
-                              host_tasks.size() * sizeof(host_tasks[0]),
-                              hipMemcpyHostToDevice, stream);
-    } catch (...) {
-        return hipErrorOutOfMemory;
-    }
+    const hipError_t plan_error = validate_interval_plan(operation, plan);
+    if (plan_error != hipSuccess) return plan_error;
+    workspace_layout layout_result = {};
+    if (!make_workspace_layout(operation, &layout_result) ||
+        workspace_bytes < layout_result.bytes) return hipErrorInvalidValue;
+    auto *workspace = static_cast<std::uint8_t *>(workspace_pointer);
+    auto *device_tasks = reinterpret_cast<q_task *>(
+        workspace + layout_result.tasks_offset);
+    return hipMemcpyWithStream(
+        device_tasks, plan.tasks, plan.task_count * sizeof(plan.tasks[0]),
+        hipMemcpyHostToDevice, stream);
 }
 
-static hipError_t launch_prepared_impl(const h3_vdn_sage_params &params,
+static hipError_t launch_prepared_impl(const params &operation_params,
                                        const hipEvent_t *marks) {
-    if (!params.query_bf16 || !params.key_bf16 || !params.value_bf16 ||
-        !params.output_bf16 || !params.workspace ||
-        params.output_bf16 == params.query_bf16 ||
-        params.output_bf16 == params.key_bf16 ||
-        params.output_bf16 == params.value_bf16 ||
-        !std::isfinite(params.scale) || params.scale <= 0.0f) {
+    if (!operation_params.query || !operation_params.key ||
+        !operation_params.value || !operation_params.output ||
+        !operation_params.workspace ||
+        operation_params.output == operation_params.query ||
+        operation_params.output == operation_params.key ||
+        operation_params.output == operation_params.value ||
+        !std::isfinite(operation_params.scale) ||
+        operation_params.scale <= 0.0f) {
         return hipErrorInvalidValue;
     }
 
-    h3_vdn_sage_workspace_layout layout = {};
-    if (!h3_vdn_sage_make_workspace_layout(params.geometry, params.pv_mode,
-                                            &layout) ||
-        params.workspace_bytes < layout.bytes) {
-        return params.pv_mode == h3_vdn_sage_pv_mode::bf16
-                   ? hipErrorInvalidValue
-                   : hipErrorNotSupported;
-    }
+    const hipError_t descriptor_error =
+        validate_descriptor(operation_params.operation);
+    if (descriptor_error != hipSuccess) return descriptor_error;
+    workspace_layout layout_result = {};
+    if (!make_workspace_layout(operation_params.operation, &layout_result) ||
+        operation_params.workspace_bytes < layout_result.bytes)
+        return hipErrorInvalidValue;
 
     int device = 0;
     hipError_t error = hipGetDevice(&device);
@@ -461,97 +466,101 @@ static hipError_t launch_prepared_impl(const h3_vdn_sage_params &params,
     error = hipGetDeviceProperties(&properties, device);
     if (error != hipSuccess) return error;
     if (!is_gfx12_device(properties)) return hipErrorNotSupported;
-    if (layout.task_count >
+    if (layout_result.task_count >
             static_cast<std::size_t>(properties.maxGridSize[0]) ||
-        layout.q_groups >
+        layout_result.q_groups >
             static_cast<std::size_t>(properties.maxGridSize[0]) ||
-        layout.k_groups >
+        layout_result.k_groups >
             static_cast<std::size_t>(properties.maxGridSize[0]) ||
-        params.geometry.heads >
+        operation_params.operation.shape.query_heads >
             static_cast<std::uint32_t>(properties.maxGridSize[1])) {
         return hipErrorInvalidConfiguration;
     }
 
     try {
-        auto *workspace = static_cast<std::uint8_t *>(params.workspace);
+        auto *workspace =
+            static_cast<std::uint8_t *>(operation_params.workspace);
         auto *q_i8 = reinterpret_cast<std::int8_t *>(
-            workspace + layout.q_i8_offset);
+            workspace + layout_result.q_i8_offset);
         auto *k_i8 = reinterpret_cast<std::int8_t *>(
-            workspace + layout.k_i8_offset);
+            workspace + layout_result.k_i8_offset);
         auto *q_scales = reinterpret_cast<float *>(
-            workspace + layout.q_scale_offset);
+            workspace + layout_result.q_scale_offset);
         auto *k_scales = reinterpret_cast<float *>(
-            workspace + layout.k_scale_offset);
-        auto *device_tasks = reinterpret_cast<h3_vdn_q_task *>(
-            workspace + layout.tasks_offset);
+            workspace + layout_result.k_scale_offset);
+        auto *device_tasks = reinterpret_cast<q_task *>(
+            workspace + layout_result.tasks_offset);
 
         if (marks) {
-            error = hipEventRecord(marks[0], params.stream);
+            error = hipEventRecord(marks[0], operation_params.stream);
             if (error != hipSuccess) return error;
         }
         const dim3 q_grid(
-            static_cast<unsigned int>(layout.q_groups),
-            params.geometry.heads);
+            static_cast<unsigned int>(layout_result.q_groups),
+            operation_params.operation.shape.query_heads);
         hipLaunchKernelGGL(
             (quantize_nhd_bf16_i8_kernel<32>), q_grid,
-            dim3(kQuantThreads), 0, params.stream,
-            static_cast<const hip_bfloat16 *>(params.query_bf16), q_i8,
-            q_scales, params.geometry.sequence, params.geometry.heads,
-            static_cast<std::uint32_t>(layout.q_groups));
+            dim3(kQuantThreads), 0, operation_params.stream,
+            static_cast<const hip_bfloat16 *>(operation_params.query), q_i8,
+            q_scales, operation_params.operation.shape.query_sequence,
+            operation_params.operation.shape.query_heads,
+            static_cast<std::uint32_t>(layout_result.q_groups));
         error = hipGetLastError();
         if (error != hipSuccess) return error;
         if (marks) {
-            error = hipEventRecord(marks[1], params.stream);
+            error = hipEventRecord(marks[1], operation_params.stream);
             if (error != hipSuccess) return error;
         }
 
         const dim3 k_grid(
-            static_cast<unsigned int>(layout.k_groups),
-            params.geometry.heads);
+            static_cast<unsigned int>(layout_result.k_groups),
+            operation_params.operation.shape.key_value_heads);
         hipLaunchKernelGGL(
             (quantize_nhd_bf16_i8_kernel<64>), k_grid,
-            dim3(kQuantThreads), 0, params.stream,
-            static_cast<const hip_bfloat16 *>(params.key_bf16), k_i8,
-            k_scales, params.geometry.sequence, params.geometry.heads,
-            static_cast<std::uint32_t>(layout.k_groups));
+            dim3(kQuantThreads), 0, operation_params.stream,
+            static_cast<const hip_bfloat16 *>(operation_params.key), k_i8,
+            k_scales, operation_params.operation.shape.key_value_sequence,
+            operation_params.operation.shape.key_value_heads,
+            static_cast<std::uint32_t>(layout_result.k_groups));
         error = hipGetLastError();
         if (error != hipSuccess) return error;
         if (marks) {
-            error = hipEventRecord(marks[2], params.stream);
+            error = hipEventRecord(marks[2], operation_params.stream);
             if (error != hipSuccess) return error;
         }
 
         const dim3 attention_grid(
-            static_cast<unsigned int>(layout.task_count),
-            params.geometry.heads);
+            static_cast<unsigned int>(layout_result.task_count),
+            operation_params.operation.shape.query_heads);
         hipLaunchKernelGGL(
-            vdn_sage_i8_bf16_gfx12_kernel, attention_grid, dim3(64), 0,
-            params.stream, q_i8, k_i8,
-            static_cast<const hip_bfloat16 *>(params.value_bf16),
-            static_cast<hip_bfloat16 *>(params.output_bf16), q_scales,
+            interval_sage_i8_bf16_gfx12_kernel, attention_grid, dim3(64), 0,
+            operation_params.stream, q_i8, k_i8,
+            static_cast<const hip_bfloat16 *>(operation_params.value),
+            static_cast<hip_bfloat16 *>(operation_params.output), q_scales,
             k_scales, device_tasks,
-            static_cast<std::uint32_t>(layout.task_count),
-            params.geometry.sequence, params.geometry.heads,
-            static_cast<std::uint32_t>(layout.q_groups),
-            static_cast<std::uint32_t>(layout.k_groups), params.scale);
+            static_cast<std::uint32_t>(layout_result.task_count),
+            operation_params.operation.shape.query_sequence,
+            operation_params.operation.shape.query_heads,
+            static_cast<std::uint32_t>(layout_result.q_groups),
+            static_cast<std::uint32_t>(layout_result.k_groups),
+            operation_params.scale);
         error = hipGetLastError();
         if (error != hipSuccess) return error;
-        if (marks) return hipEventRecord(marks[3], params.stream);
+        if (marks) return hipEventRecord(marks[3], operation_params.stream);
         return hipSuccess;
     } catch (...) {
         return hipErrorOutOfMemory;
     }
 }
 
-hipError_t h3_vdn_sage_launch_prepared(const h3_vdn_sage_params &params) {
-    return launch_prepared_impl(params, nullptr);
+hipError_t launch_prepared(const params &operation_params) {
+    return launch_prepared_impl(operation_params, nullptr);
 }
 
-hipError_t h3_vdn_sage_launch_profiled(
-    const h3_vdn_sage_params &params,
-    h3_vdn_sage_profile *profile) {
-    if (!profile) return hipErrorInvalidValue;
-    *profile = {};
+hipError_t launch_profiled(const params &operation_params,
+                           profile *timing) {
+    if (!timing) return hipErrorInvalidValue;
+    *timing = {};
     hipEvent_t marks[4] = {};
     hipError_t error = hipSuccess;
     int created = 0;
@@ -559,19 +568,22 @@ hipError_t h3_vdn_sage_launch_profiled(
         error = hipEventCreate(&marks[created]);
         if (error != hipSuccess) break;
     }
-    if (error == hipSuccess) error = launch_prepared_impl(params, marks);
+    if (error == hipSuccess)
+        error = launch_prepared_impl(operation_params, marks);
     if (error == hipSuccess) error = hipEventSynchronize(marks[3]);
     if (error == hipSuccess)
-        error = hipEventElapsedTime(&profile->q_quant_ms, marks[0], marks[1]);
+        error = hipEventElapsedTime(&timing->q_quant_ms, marks[0], marks[1]);
     if (error == hipSuccess)
-        error = hipEventElapsedTime(&profile->k_quant_ms, marks[1], marks[2]);
+        error = hipEventElapsedTime(&timing->k_quant_ms, marks[1], marks[2]);
     if (error == hipSuccess)
-        error = hipEventElapsedTime(&profile->attention_ms, marks[2], marks[3]);
+        error = hipEventElapsedTime(&timing->attention_ms, marks[2], marks[3]);
     if (error == hipSuccess)
-        error = hipEventElapsedTime(&profile->total_ms, marks[0], marks[3]);
+        error = hipEventElapsedTime(&timing->total_ms, marks[0], marks[3]);
     for (int index = 0; index < created; ++index) {
         const hipError_t ignored = hipEventDestroy(marks[index]);
         (void)ignored;
     }
     return error;
 }
+
+}  // namespace sageattention
