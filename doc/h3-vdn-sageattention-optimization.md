@@ -1496,3 +1496,18 @@ E33 三轮 candidate hash 固定为 `4dab19426ebe2ef2`，portable exact hash 固
 全部通过。dirty 报告位于 ignored `build/sagectl/campaigns/`，只能作为形成源码提交前
 的 research evidence。下一步更新 public README、全量 clean rebuild 后提交源码，
 再从该 clean commit 重跑相同 campaign 并把单独的 immutable result 纳入 registry。
+
+源码提交 `c74ea309cf6d5476abceb387e641d5d0d331ee07` 形成后，工作树 clean 状态下的
+同一 campaign 完整通过。short speedup 为 24.456x；三轮 exact/E33 event median 为
+`461.296509/19.145887`、`462.824036/19.247160`、
+`499.504852/19.290936 ms`，paired speedup median/geomean 为
+`24.0938x/24.6630x`。Exact 第三轮有一个 1005.378 ms outlier，故不把 exact range
+包装成稳定 kernel latency；E33 三轮 event median 仅跨 0.145 ms，数值 hash/质量仍
+逐轮完全固定。
+
+中间轮 E33 session 原样登记为不可变 result
+`2026-09-15-r9700-e33-h3-vdn-gpu4-a`：event median/min/max 为
+`19.247160/18.946093/20.146872 ms`，paired RMSE/cosine 为
+`0.000215744884812/0.999999976728`，clean source、HIP4/card7/e3、双 idle poll、
+命令、warmup 和 iteration 均完整。该 evidence 仍标为 research，只有 operator gate
+通过；H3 audio/model gate 继续 pending。

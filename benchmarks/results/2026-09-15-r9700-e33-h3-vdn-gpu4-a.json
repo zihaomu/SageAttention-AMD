@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "result_id": "2026-09-15-r9700-e33-h3-vdn-gpu4-a",
+  "recorded_at": "2026-09-15T18:32:40+08:00",
+  "evidence_level": "research",
+  "measurement_scope": "operator-including-qk-quantization",
+  "git_commit": "c74ea309cf6d5476abceb387e641d5d0d331ee07",
+  "source_dirty": false,
+  "platform_id": "r9700-gfx1201-rocm7.2.3-ubuntu24.04",
+  "kernel_id": "e33-bf16-qk-gfx12-d128",
+  "workload_id": "h3-vdn-s5338-h56-d128",
+  "session": {
+    "physical_device_index": 4,
+    "rocm_smi_index": 7,
+    "pci_bus": "0000:e3:00.0",
+    "gpu_use_percent_before": 2,
+    "gpu_memory_percent_before": 0,
+    "idle_preflight_polls": 1,
+    "launch_idle_preflight_polls": 1,
+    "idle_retry_delay_seconds": 1.0,
+    "command": "./tools/sagectl benchmark --gpu 4 --platform r9700-gfx1201-rocm7.2.3-ubuntu24.04 --kernel e33-bf16-qk-gfx12-d128 --workload h3-vdn-s5338-h56-d128 --iterations 5",
+    "warmup_iterations": 3,
+    "measured_iterations": 5,
+    "runner": "generic-interval-v1"
+  },
+  "metrics_ms": {
+    "metadata_cold": 0.04956,
+    "q_quant": 0.0,
+    "k_quant": 0.0,
+    "attention": 19.424356,
+    "profile_total": 19.434437,
+    "event_median": 19.24716,
+    "event_min": 18.946093,
+    "event_max": 20.146872,
+    "wall_per_iteration": 19.413977
+  },
+  "resources": {
+    "tasks": 167,
+    "workspace_bytes": 8704
+  },
+  "correctness": {
+    "contract_test": "pass-before-clean-campaign",
+    "gpu_test": "pass-before-clean-campaign",
+    "isa_test": "pass-before-clean-campaign",
+    "non_finite": 0,
+    "deterministic": true,
+    "guard_canaries": true,
+    "output_hash": "4dab19426ebe2ef2",
+    "cpu_reference": "skipped-large-workload",
+    "cpu_max_abs": 0,
+    "cpu_relative_rmse": 0,
+    "paired_reference": "pass",
+    "paired_max_abs": 3.81469727e-06,
+    "paired_relative_rmse": 0.000215744884812,
+    "paired_cosine": 0.999999976728,
+    "paired_non_finite": 0,
+    "paired_reference_hash": "4c9447152b73ee7b"
+  },
+  "qualification": {
+    "operator_gates": "pass",
+    "downstream_h3_audio_gate": "pending",
+    "note": "Clean-commit operator evidence; E33 remains experimental and explicit-only until H3 downstream gates pass."
+  }
+}

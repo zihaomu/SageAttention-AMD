@@ -47,10 +47,10 @@
     "pv_probability_storage": "bf16-hi-plus-bf16-residual"
   },
   "validation": {
-    "operator_correctness": "pass-gfx1201-2026-09-14",
+    "operator_correctness": "pass-result-2026-09-15-r9700-e33-h3-vdn-gpu4-a",
     "guard_canaries": "pass-gfx1201-2026-09-14",
     "determinism": "pass-gfx1201-2026-09-14",
-    "isa": "pass-24-bf16-wmma-instructions-2026-09-14",
+    "isa": "pass-24-bf16-wmma-instructions-2026-09-15",
     "downstream_h3_audio_gate": "pending"
   },
   "limitations": [

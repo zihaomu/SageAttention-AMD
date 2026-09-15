@@ -202,6 +202,12 @@ These measurements are workload-specific. Cross-device absolute values are
 not mixed into one baseline; GPU4 is the formal promotion device, while GPU5
 and GPU6 results are research or stability evidence.
 
+The clean E33 operator record on GPU4/BDF `0000:e3:00.0` reports 19.247 ms
+event median (18.946--20.147 ms), including its zero-cost Q/K quantization
+fields. Against a separately timed portable-exact output from the same input,
+relative RMSE is 0.000215745 and cosine is 0.999999976728. This is upstream
+operator evidence only; it is not an H3 end-to-end promotion result.
+
 ## Quality status
 
 E27 is fast and passes operator correctness, real 50-layer propagation,
