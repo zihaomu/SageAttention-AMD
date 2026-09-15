@@ -51,7 +51,7 @@
     "guard_canaries": "pass-gfx1201-2026-09-14",
     "determinism": "pass-gfx1201-2026-09-14",
     "isa": "pass-24-bf16-wmma-instructions-2026-09-15",
-    "downstream_h3_audio_gate": "pending"
+    "downstream_h3_audio_gate": "fail-prompt2-8nfe-2026-09-15"
   },
   "limitations": [
     "Explicit experimental selection only; never an H3 automatic default.",

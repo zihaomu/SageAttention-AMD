@@ -225,10 +225,11 @@ The H3 integration therefore keeps exact BF16 wave32 as `auto` and exposes
 E27 only through explicit `H3_VDN_SDPA=sage-i8-bf16` selection. Operator speed
 must not be presented as model-level acceptance.
 
-E33 is an upstream experimental candidate, not an H3 default. Its BF16-QK and
-compensated-BF16-PV path must first receive immutable clean-commit evidence,
-then pass H3 prompt-2 50-layer, 8-NFE, and three-prompt media gates under a new
-explicit mode. Until then, H3's E27 and exact behavior is unchanged.
+E33 is an upstream experimental candidate, not an H3 default. It passed clean
+operator evidence and H3 prompt-2 50-layer thresholds, but failed the 8-NFE
+audio latent gate at 10.684% relative RMSE and 0.994280 cosine; video passed.
+The three-prompt media gate was therefore not run. H3's E27 and exact default
+behavior remains unchanged.
 
 ## Repository layout
 
