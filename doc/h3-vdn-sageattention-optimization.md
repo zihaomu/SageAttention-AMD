@@ -1511,3 +1511,23 @@ E33 三轮 candidate hash 固定为 `4dab19426ebe2ef2`，portable exact hash 固
 `0.000215744884812/0.999999976728`，clean source、HIP4/card7/e3、双 idle poll、
 命令、warmup 和 iteration 均完整。该 evidence 仍标为 research，只有 operator gate
 通过；H3 audio/model gate 继续 pending。
+
+H3 prompt 2 模型门禁随后给出新的边界：50 层最终 audio RMSE/cosine 为
+`4.02281%/0.999193881`，勉强通过；8-NFE video 为
+`0.21219%/0.999997758`，但 audio 扩大到 `10.68372%/0.994280444`，明确失败。
+因此双项 probability compensation 不进入三 prompt，也不 promotion。
+
+E33-R4 的单一假设是：第二个 BF16 residual 仍留下足以在 8-NFE 音频中累计的 PV
+舍入误差；将 F32 probability 分解为 `BF16 high + residual-1 + residual-2` 并执行
+第三次 BF16-PV/F32-accumulate WMMA，应将该部分误差再降低约一个 BF16 舍入量级。
+快速失败条件冻结为：production operator paired RMSE 必须相对
+`0.000215744884812` 有数量级改善，finite/canary/determinism 和至少 32 条 E33 BF16
+WMMA 必须通过，event 仍须保留 H3 完整 E2E >10% 的潜力；否则不重跑模型长测并撤销
+R4。通过后才允许更新 clean evidence 并依次重跑 prompt 2 50 层与 8-NFE。
+
+E33-R4 按快速失败条件 `REJECT` 并已从 device 源码/ISA 门禁清理。GPU4 full suite
+仍通过，但小几何 E33 RMSE 只从 `0.001673401` 变为 `0.001673363`；production
+operator event 从 clean 双项候选 19.247 ms 增至 23.209 ms，paired RMSE 反而从
+`0.000215744884812` 增至 `0.000266110605655`，hash 也随之改变。第三个极小 tail
+逐 tile 加入现有 F32 accumulator 会改变累计舍入，却没有带来期望的质量下降，故未
+进入任何 H3 长测、未修改 registry/result，也不继续堆叠更多 residual。
