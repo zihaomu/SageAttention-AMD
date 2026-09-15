@@ -59,13 +59,15 @@ bool scalar_allowed(const h3_vdn_sage_geometry &g, std::uint32_t query,
 sageattention::descriptor generic_descriptor(
     const h3_vdn_sage_geometry &geometry,
     std::size_t task_count,
+    sageattention::qk_mode qk =
+        sageattention::qk_mode::symmetric_i8,
     sageattention::kernel_id kernel =
         sageattention::kernel_id::e27_gfx12_d128) {
     return {{1, geometry.sequence, geometry.sequence, geometry.heads,
              geometry.heads, geometry.head_dim, sageattention::layout::nhd},
             {sageattention::data_type::bf16,
              sageattention::data_type::bf16,
-             sageattention::qk_mode::symmetric_i8,
+             qk,
              sageattention::pv_mode::bf16, kernel},
             task_count};
 }
@@ -206,6 +208,32 @@ bool test_generic_interval_plan() {
     CHECK(sageattention::validate_descriptor(automatic) == hipSuccess);
     CHECK(sageattention::workspace_size(automatic) ==
           sageattention::workspace_size(operation));
+
+    const sageattention::descriptor bf16_qk = generic_descriptor(
+        geometry, task_count, sageattention::qk_mode::bf16,
+        sageattention::kernel_id::e33_bf16_qk_gfx12_d128);
+    CHECK(sageattention::validate_descriptor(bf16_qk) == hipSuccess);
+    CHECK(sageattention::validate_interval_plan(bf16_qk, plan) ==
+          hipSuccess);
+    CHECK(sageattention::workspace_size(bf16_qk) > 0);
+    CHECK(sageattention::workspace_size(bf16_qk) <
+          sageattention::workspace_size(operation));
+    sageattention::descriptor bf16_automatic = bf16_qk;
+    bf16_automatic.options.kernel =
+        sageattention::kernel_id::automatic_select;
+    CHECK(sageattention::validate_descriptor(bf16_automatic) == hipSuccess);
+    CHECK(sageattention::workspace_size(bf16_automatic) ==
+          sageattention::workspace_size(bf16_qk));
+    sageattention::descriptor mismatched_kernel = bf16_qk;
+    mismatched_kernel.options.kernel =
+        sageattention::kernel_id::e27_gfx12_d128;
+    CHECK(sageattention::validate_descriptor(mismatched_kernel) ==
+          hipErrorNotSupported);
+    mismatched_kernel = operation;
+    mismatched_kernel.options.kernel =
+        sageattention::kernel_id::e33_bf16_qk_gfx12_d128;
+    CHECK(sageattention::validate_descriptor(mismatched_kernel) ==
+          hipErrorNotSupported);
 
     for (std::uint32_t query = 0; query < geometry.sequence; ++query) {
         for (std::uint32_t key = 0; key < geometry.sequence; ++key) {

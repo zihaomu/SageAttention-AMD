@@ -51,6 +51,19 @@ constexpr kernel_registration kKernelRegistrations[] = {
      128,
      32,
      max_intervals_per_task},
+    {kernel_id::e33_bf16_qk_gfx12_d128,
+     "e33_bf16_qk_gfx12_d128",
+     {"gfx1201", nullptr},
+     32,
+     layout::nhd,
+     data_type::bf16,
+     data_type::bf16,
+     qk_mode::bf16,
+     pv_mode::bf16,
+     1,
+     128,
+     32,
+     max_intervals_per_task},
 };
 
 bool descriptor_matches_registration(
@@ -191,51 +204,60 @@ bool make_workspace_layout(const descriptor &operation,
         return false;
 
     workspace_layout result = {};
-    result.q_groups =
-        (static_cast<std::size_t>(operation.shape.query_sequence) + 31) / 32;
-    result.k_groups =
-        (static_cast<std::size_t>(operation.shape.key_value_sequence) + 63) /
-        64;
     result.task_count = operation.task_count;
-
-    std::size_t q_elements = 0;
-    std::size_t k_elements = 0;
-    if (!checked_mul(operation.shape.batch, operation.shape.query_sequence,
-                     &q_elements) ||
-        !checked_mul(q_elements, operation.shape.query_heads, &q_elements) ||
-        !checked_mul(q_elements, operation.shape.head_dimension,
-                     &q_elements) ||
-        !checked_mul(operation.shape.batch,
-                     operation.shape.key_value_sequence, &k_elements) ||
-        !checked_mul(k_elements, operation.shape.key_value_heads,
-                     &k_elements) ||
-        !checked_mul(k_elements, operation.shape.head_dimension,
-                     &k_elements)) {
-        return false;
-    }
-
     std::size_t cursor = 0;
-    result.q_i8_offset = cursor;
-    if (!checked_add(cursor, q_elements, &cursor) ||
-        !checked_align(cursor, kWorkspaceAlignment, &cursor)) return false;
-    result.k_i8_offset = cursor;
-    if (!checked_add(cursor, k_elements, &cursor) ||
-        !checked_align(cursor, kWorkspaceAlignment, &cursor)) return false;
+    if (operation.options.qk == qk_mode::symmetric_i8) {
+        result.q_groups =
+            (static_cast<std::size_t>(operation.shape.query_sequence) + 31) /
+            32;
+        result.k_groups =
+            (static_cast<std::size_t>(operation.shape.key_value_sequence) +
+             63) /
+            64;
 
-    std::size_t scale_elements = 0;
-    std::size_t scale_bytes = 0;
-    result.q_scale_offset = cursor;
-    if (!checked_mul(operation.shape.query_heads, result.q_groups,
-                     &scale_elements) ||
-        !checked_mul(scale_elements, sizeof(float), &scale_bytes) ||
-        !checked_add(cursor, scale_bytes, &cursor) ||
-        !checked_align(cursor, kWorkspaceAlignment, &cursor)) return false;
-    result.k_scale_offset = cursor;
-    if (!checked_mul(operation.shape.key_value_heads, result.k_groups,
-                     &scale_elements) ||
-        !checked_mul(scale_elements, sizeof(float), &scale_bytes) ||
-        !checked_add(cursor, scale_bytes, &cursor) ||
-        !checked_align(cursor, kWorkspaceAlignment, &cursor)) return false;
+        std::size_t q_elements = 0;
+        std::size_t k_elements = 0;
+        if (!checked_mul(operation.shape.batch,
+                         operation.shape.query_sequence, &q_elements) ||
+            !checked_mul(q_elements, operation.shape.query_heads,
+                         &q_elements) ||
+            !checked_mul(q_elements, operation.shape.head_dimension,
+                         &q_elements) ||
+            !checked_mul(operation.shape.batch,
+                         operation.shape.key_value_sequence, &k_elements) ||
+            !checked_mul(k_elements, operation.shape.key_value_heads,
+                         &k_elements) ||
+            !checked_mul(k_elements, operation.shape.head_dimension,
+                         &k_elements)) {
+            return false;
+        }
+
+        result.q_i8_offset = cursor;
+        if (!checked_add(cursor, q_elements, &cursor) ||
+            !checked_align(cursor, kWorkspaceAlignment, &cursor))
+            return false;
+        result.k_i8_offset = cursor;
+        if (!checked_add(cursor, k_elements, &cursor) ||
+            !checked_align(cursor, kWorkspaceAlignment, &cursor))
+            return false;
+
+        std::size_t scale_elements = 0;
+        std::size_t scale_bytes = 0;
+        result.q_scale_offset = cursor;
+        if (!checked_mul(operation.shape.query_heads, result.q_groups,
+                         &scale_elements) ||
+            !checked_mul(scale_elements, sizeof(float), &scale_bytes) ||
+            !checked_add(cursor, scale_bytes, &cursor) ||
+            !checked_align(cursor, kWorkspaceAlignment, &cursor))
+            return false;
+        result.k_scale_offset = cursor;
+        if (!checked_mul(operation.shape.key_value_heads, result.k_groups,
+                         &scale_elements) ||
+            !checked_mul(scale_elements, sizeof(float), &scale_bytes) ||
+            !checked_add(cursor, scale_bytes, &cursor) ||
+            !checked_align(cursor, kWorkspaceAlignment, &cursor))
+            return false;
+    }
 
     std::size_t task_bytes = 0;
     result.tasks_offset = cursor;

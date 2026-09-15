@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "campaign_id": "gfx1201-h3-vdn-e33-bf16-qk",
+  "status": "active",
+  "platform_id": "r9700-gfx1201-rocm7.2.3-ubuntu24.04",
+  "workload_ids": [
+    "h3-vdn-s5338-h56-d128"
+  ],
+  "baseline_kernel_id": "exact-wave32-bf16-gfx1201-d128",
+  "candidate_kernel_ids": [
+    "e33-bf16-qk-gfx12-d128"
+  ],
+  "hypothesis": "Removing E27 Q/K INT8 quantization and compensating each PV probability as BF16 high plus BF16 residual will reduce H3 audio error while remaining materially faster than the exact wave32 BF16 production baseline; the portable exact kernel remains the paired numerical oracle only.",
+  "objective": {
+    "metric": "event_median",
+    "direction": "minimize",
+    "measurement_scope": "operator-including-qk-quantization"
+  },
+  "search_space": {
+    "kind": "registered-kernel-comparison",
+    "kernel_ids": [
+      "e33-bf16-qk-gfx12-d128"
+    ]
+  },
+  "gates": {
+    "require_cpu_reference": false,
+    "require_guard_canaries": true,
+    "require_determinism": true,
+    "max_paired_relative_rmse": 0.00361012,
+    "min_paired_cosine": 0.999993587,
+    "short_iterations": 3,
+    "confirmation_iterations": 5,
+    "confirmation_runs": 3,
+    "top_k_for_confirmation": 1
+  },
+  "acceptance": {
+    "minimum_speedup": 2.0,
+    "stopping_rule": "Stop before H3 integration unless GPU correctness, canaries, determinism, BF16 WMMA ISA, and the paired production operator threshold all pass. H3 model and media quality remain separate downstream gates."
+  }
+}

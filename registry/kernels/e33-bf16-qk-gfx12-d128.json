@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "kernel_id": "e33-bf16-qk-gfx12-d128",
+  "status": "experimental",
+  "selector": "e33_bf16_qk_gfx12_d128",
+  "implementation": {
+    "generic_api": "include/sage_attention.hpp",
+    "generic_host": "src/sage_attention.cpp",
+    "device": "src/h3_vdn_sage_gfx12.hip"
+  },
+  "dispatch": {
+    "gpu_architectures": [
+      "gfx1201"
+    ],
+    "wavefront_size": 32,
+    "layouts": [
+      "NHD"
+    ],
+    "batch_sizes": [
+      1
+    ],
+    "head_dimensions": [
+      128
+    ],
+    "input_dtypes": [
+      "bf16"
+    ],
+    "output_dtypes": [
+      "bf16"
+    ],
+    "mask_plan_classes": [
+      "ordered-interval-v1"
+    ]
+  },
+  "algorithm": {
+    "qk": "bf16-wmma-fp32-accumulate",
+    "pv": "bf16-hi-plus-bf16-residual-wmma-fp32-accumulate",
+    "softmax": "streaming-fp32-online",
+    "q_tile_rows": 32,
+    "k_tile_rows": 16,
+    "head_dimension": 128,
+    "materializes_score_matrix": false
+  },
+  "quantization": {
+    "q": "none",
+    "k": "none",
+    "pv_probability_storage": "bf16-hi-plus-bf16-residual"
+  },
+  "validation": {
+    "operator_correctness": "pass-gfx1201-2026-09-14",
+    "guard_canaries": "pass-gfx1201-2026-09-14",
+    "determinism": "pass-gfx1201-2026-09-14",
+    "isa": "pass-24-bf16-wmma-instructions-2026-09-14",
+    "downstream_h3_audio_gate": "pending"
+  },
+  "limitations": [
+    "Explicit experimental selection only; never an H3 automatic default.",
+    "The ordered-interval plan ABI accepts at most 32 query rows and 5 key intervals per task.",
+    "Only gfx1201 wave32, BF16 input/output and D128 are validated.",
+    "Compensated probability uses two BF16 PV WMMA operations per output tile."
+  ]
+}

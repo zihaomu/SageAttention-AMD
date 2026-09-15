@@ -3,6 +3,7 @@
 
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
+#include <rocwmma/rocwmma.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -45,6 +46,92 @@ struct device_buffer {
     }
 };
 
+__global__ void probe_bf16_wmma_accumulator_layout_kernel(
+    float *__restrict__ raw, float *__restrict__ stored) {
+#if defined(__gfx12__) || defined(__gfx1200__) || defined(__gfx1201__)
+    using bf16 = rocwmma::bfloat16_t;
+    __shared__ bf16 matrix_a[16 * 16];
+    __shared__ bf16 matrix_b[16 * 16];
+    const std::uint32_t lane = threadIdx.x;
+    for (std::uint32_t index = lane; index < 16 * 16; index += 32) {
+        const std::uint32_t row = index / 16;
+        const std::uint32_t column = index % 16;
+        matrix_a[index] = bf16(row == column ? 1.0f : 0.0f);
+        matrix_b[index] = bf16(static_cast<float>(index));
+    }
+    __syncthreads();
+    rocwmma::fragment<rocwmma::matrix_a, 16, 16, 16, bf16,
+                      rocwmma::row_major>
+        a;
+    rocwmma::fragment<rocwmma::matrix_b, 16, 16, 16, bf16,
+                      rocwmma::row_major>
+        b;
+    rocwmma::fragment<rocwmma::accumulator, 16, 16, 16, float> result;
+    rocwmma::load_matrix_sync(a, matrix_a, 16);
+    rocwmma::load_matrix_sync(b, matrix_b, 16);
+    rocwmma::fill_fragment(result, 0.0f);
+    rocwmma::mma_sync(result, a, b, result);
+#pragma unroll
+    for (int element = 0; element < 8; ++element)
+        raw[lane * 8 + static_cast<std::uint32_t>(element)] =
+            result.x[element];
+    rocwmma::store_matrix_sync(stored, result, 16,
+                               rocwmma::mem_row_major);
+#else
+    (void)raw;
+    (void)stored;
+#endif
+}
+
+bool test_bf16_wmma_accumulator_layout() {
+    constexpr std::size_t elements = 16 * 16;
+    device_buffer raw_device;
+    device_buffer stored_device;
+    CHECK(raw_device.allocate(elements * sizeof(float)) &&
+          stored_device.allocate(elements * sizeof(float)));
+    hipLaunchKernelGGL(probe_bf16_wmma_accumulator_layout_kernel, dim3(1),
+                       dim3(32), 0, nullptr,
+                       static_cast<float *>(raw_device.data),
+                       static_cast<float *>(stored_device.data));
+    HIP_CHECK(hipGetLastError());
+    std::vector<float> raw(elements), stored(elements);
+    HIP_CHECK(hipMemcpy(raw.data(), raw_device.data, elements * sizeof(float),
+                        hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(stored.data(), stored_device.data,
+                        elements * sizeof(float), hipMemcpyDeviceToHost));
+    std::size_t matrix_mismatches = 0;
+    std::size_t layout_mismatches = 0;
+    for (std::uint32_t row = 0; row < 16; ++row) {
+        for (std::uint32_t column = 0; column < 16; ++column) {
+            const float expected = static_cast<float>(row * 16 + column);
+            if (stored[row * 16 + column] != expected) ++matrix_mismatches;
+        }
+    }
+    for (std::uint32_t lane = 0; lane < 32; ++lane) {
+        for (std::uint32_t element = 0; element < 8; ++element) {
+            const std::uint32_t expected_row = element + 8 * (lane >> 4);
+            const std::uint32_t expected_column = lane & 15;
+            const float expected =
+                static_cast<float>(expected_row * 16 + expected_column);
+            if (raw[lane * 8 + element] != expected) ++layout_mismatches;
+        }
+    }
+    std::printf("gfx12 BF16 WMMA accumulator mapping: matrix_mismatches=%zu "
+                "expected_layout_mismatches=%zu\n",
+                matrix_mismatches, layout_mismatches);
+    if (layout_mismatches) {
+        for (const std::uint32_t lane : {0u, 1u, 15u, 16u, 17u, 31u}) {
+            std::printf("  lane %u raw:", lane);
+            for (std::uint32_t element = 0; element < 8; ++element)
+                std::printf(" %.0f", raw[lane * 8 + element]);
+            std::putchar('\n');
+        }
+    }
+    CHECK(matrix_mismatches == 0);
+    CHECK(layout_mismatches == 0);
+    return true;
+}
+
 std::uint64_t hash_bf16(const std::vector<hip_bfloat16> &values) {
     std::uint64_t hash = UINT64_C(1469598103934665603);
     for (const hip_bfloat16 value : values) {
@@ -56,14 +143,18 @@ std::uint64_t hash_bf16(const std::vector<hip_bfloat16> &values) {
 
 sageattention::descriptor generic_descriptor(
     const h3_vdn_sage_geometry &geometry,
-    std::size_t task_count) {
+    std::size_t task_count,
+    sageattention::qk_mode qk =
+        sageattention::qk_mode::symmetric_i8,
+    sageattention::kernel_id kernel =
+        sageattention::kernel_id::automatic_select) {
     return {{1, geometry.sequence, geometry.sequence, geometry.heads,
              geometry.heads, geometry.head_dim, sageattention::layout::nhd},
             {sageattention::data_type::bf16,
              sageattention::data_type::bf16,
-             sageattention::qk_mode::symmetric_i8,
+             qk,
              sageattention::pv_mode::bf16,
-             sageattention::kernel_id::automatic_select},
+             kernel},
             task_count};
 }
 
@@ -269,6 +360,70 @@ bool run_generic_operator(
     return true;
 }
 
+bool run_bf16_qk_operator(
+    const h3_vdn_sage_geometry &geometry,
+    const std::vector<hip_bfloat16> &query,
+    const std::vector<hip_bfloat16> &key,
+    const std::vector<hip_bfloat16> &value,
+    std::vector<hip_bfloat16> *output) {
+    const std::vector<sageattention::q_task> tasks =
+        build_generic_tasks(geometry);
+    CHECK(!tasks.empty());
+    const sageattention::descriptor operation = generic_descriptor(
+        geometry, tasks.size(), sageattention::qk_mode::bf16,
+        sageattention::kernel_id::e33_bf16_qk_gfx12_d128);
+    return run_generic_operator(
+        operation, {tasks.data(), tasks.size()}, query, key, value, output);
+}
+
+bool test_bf16_qk_correctness_and_determinism() {
+    const h3_vdn_sage_geometry geometry = {
+        83, 2, 128, 11, 6, 9, 1, 2, true};
+    const std::size_t elements = static_cast<std::size_t>(geometry.sequence) *
+                                 geometry.heads * geometry.head_dim;
+    std::vector<hip_bfloat16> q(elements), k(elements), v(elements);
+    for (std::size_t index = 0; index < elements; ++index) {
+        q[index] = hip_bfloat16(std::sin(static_cast<float>(index) * 0.013f) *
+                                0.35f);
+        k[index] = hip_bfloat16(std::cos(static_cast<float>(index) * 0.017f) *
+                                0.31f);
+        const int centered = static_cast<int>(index % 47) - 23;
+        v[index] = hip_bfloat16(static_cast<float>(centered) * 0.025f);
+    }
+    const std::vector<float> reference = cpu_attention(
+        geometry, q, k, v, 1.0f / std::sqrt(128.0f));
+    std::vector<hip_bfloat16> actual(elements);
+    CHECK(run_bf16_qk_operator(geometry, q, k, v, &actual));
+    double error2 = 0.0;
+    double reference2 = 0.0;
+    double actual2 = 0.0;
+    double dot = 0.0;
+    float max_absolute = 0.0f;
+    std::size_t non_finite = 0;
+    for (std::size_t index = 0; index < elements; ++index) {
+        const double observed = static_cast<float>(actual[index]);
+        const double expected = reference[index];
+        if (!std::isfinite(observed)) ++non_finite;
+        const double error = observed - expected;
+        error2 += error * error;
+        reference2 += expected * expected;
+        actual2 += observed * observed;
+        dot += observed * expected;
+        max_absolute = std::max(
+            max_absolute, static_cast<float>(std::fabs(error)));
+    }
+    const double relative_rmse = std::sqrt(error2 / reference2);
+    const double cosine = dot / std::sqrt(reference2 * actual2);
+    std::printf("E33 BF16-QK correctness: max_abs=%.7g rel_rmse=%.7g "
+                "cosine=%.9f non_finite=%zu hash=%016llx\n",
+                max_absolute, relative_rmse, cosine, non_finite,
+                static_cast<unsigned long long>(hash_bf16(actual)));
+    CHECK(non_finite == 0);
+    CHECK(relative_rmse < 0.003);
+    CHECK(cosine > 0.999995);
+    return true;
+}
+
 bool test_manual_generic_interval_plan() {
     const sageattention::q_task tasks[] = {
         {0, 10, 2, {{0, 5}, {20, 35}}},
@@ -297,8 +452,16 @@ bool test_manual_generic_interval_plan() {
     }
     std::vector<hip_bfloat16> output(elements);
     CHECK(run_generic_operator(operation, plan, query, key, value, &output));
+    sageattention::descriptor bf16_qk_operation = operation;
+    bf16_qk_operation.options.qk = sageattention::qk_mode::bf16;
+    bf16_qk_operation.options.kernel =
+        sageattention::kernel_id::e33_bf16_qk_gfx12_d128;
+    std::vector<hip_bfloat16> bf16_qk_output(elements);
+    CHECK(run_generic_operator(bf16_qk_operation, plan, query, key, value,
+                               &bf16_qk_output));
 
     float max_absolute = 0.0f;
+    float bf16_qk_max_absolute = 0.0f;
     for (std::uint32_t query_row = 0; query_row < 35; ++query_row) {
         std::uint32_t allowed_count = 0;
         for (std::uint32_t key_row = 0; key_row < 35; ++key_row)
@@ -323,10 +486,20 @@ bool test_manual_generic_interval_plan() {
             CHECK(std::isfinite(observed));
             max_absolute =
                 std::max(max_absolute, std::fabs(observed - expected));
+            const float bf16_qk_observed = static_cast<float>(
+                bf16_qk_output[static_cast<std::size_t>(query_row) * 128 +
+                                dimension]);
+            CHECK(std::isfinite(bf16_qk_observed));
+            bf16_qk_max_absolute = std::max(
+                bf16_qk_max_absolute,
+                std::fabs(bf16_qk_observed - expected));
         }
     }
-    std::printf("generic manual intervals: max_abs=%.7g\n", max_absolute);
+    std::printf("generic manual intervals: E27 max_abs=%.7g "
+                "E33 max_abs=%.7g\n",
+                max_absolute, bf16_qk_max_absolute);
     CHECK(max_absolute < 0.005f);
+    CHECK(bf16_qk_max_absolute < 0.005f);
     return true;
 }
 
@@ -453,7 +626,8 @@ bool test_h3_17_frame_misaligned_geometry() {
 
 bool check_targeted_geometry(const char *name,
                              const h3_vdn_sage_geometry &geometry,
-                             bool extreme_scores) {
+                             bool extreme_scores,
+                             bool bf16_qk = false) {
     const std::size_t elements = static_cast<std::size_t>(geometry.sequence) *
                                  geometry.heads * geometry.head_dim;
     std::vector<hip_bfloat16> q(elements), k(elements), v(elements);
@@ -476,7 +650,9 @@ bool check_targeted_geometry(const char *name,
     const std::vector<float> reference = cpu_attention(
         geometry, q, k, v, 1.0f / std::sqrt(128.0f));
     std::vector<hip_bfloat16> actual(elements);
-    CHECK(run_operator(geometry, q, k, v, &actual));
+    CHECK(bf16_qk
+              ? run_bf16_qk_operator(geometry, q, k, v, &actual)
+              : run_operator(geometry, q, k, v, &actual));
 
     double error2 = 0.0;
     double reference2 = 0.0;
@@ -495,13 +671,14 @@ bool check_targeted_geometry(const char *name,
     }
     const double relative_rmse = std::sqrt(error2 / reference2);
     const double cosine = dot / std::sqrt(reference2 * actual2);
-    std::printf("targeted %s: S=%u H=%u rel_rmse=%.7g cosine=%.9f "
+    std::printf("targeted %s%s: S=%u H=%u rel_rmse=%.7g cosine=%.9f "
                 "non_finite=%zu\n",
-                name, geometry.sequence, geometry.heads, relative_rmse,
+                name, bf16_qk ? " E33" : "", geometry.sequence,
+                geometry.heads, relative_rmse,
                 cosine, non_finite);
     CHECK(non_finite == 0);
-    CHECK(relative_rmse <= 0.05);
-    CHECK(cosine >= 0.999);
+    CHECK(relative_rmse <= (bf16_qk ? 0.003 : 0.05));
+    CHECK(cosine >= (bf16_qk ? 0.999995 : 0.999));
     return true;
 }
 
@@ -521,6 +698,25 @@ bool test_targeted_h3_geometries() {
            check_targeted_geometry("anchor-off-multi-interval",
                                    anchor_off_multi_interval, false) &&
            check_targeted_geometry("extreme-scores", extreme_scores, true);
+}
+
+bool test_bf16_qk_targeted_geometries() {
+    const h3_vdn_sage_geometry single_dense_tail = {
+        13, 1, 128, 0, 1, 13, 0, 1, true};
+    const h3_vdn_sage_geometry one_key_intervals = {
+        13, 1, 128, 0, 13, 1, 0, 0, false};
+    const h3_vdn_sage_geometry anchor_off_multi_interval = {
+        47, 2, 128, 5, 7, 5, 2, 3, false};
+    const h3_vdn_sage_geometry extreme_scores = {
+        31, 1, 128, 3, 7, 4, 0, 2, false};
+    return check_targeted_geometry("single-dense-tail", single_dense_tail,
+                                   false, true) &&
+           check_targeted_geometry("one-key-intervals", one_key_intervals,
+                                   false, true) &&
+           check_targeted_geometry("anchor-off-multi-interval",
+                                   anchor_off_multi_interval, false, true) &&
+           check_targeted_geometry("extreme-scores", extreme_scores, true,
+                                   true);
 }
 
 bool test_output_and_workspace_guards() {
@@ -590,6 +786,83 @@ bool test_output_and_workspace_guards() {
     CHECK(guard_is_intact());
     HIP_CHECK(hipStreamDestroy(stream));
     std::puts("output/workspace guard canaries: intact");
+    return true;
+}
+
+bool test_bf16_qk_output_and_workspace_guards() {
+    const h3_vdn_sage_geometry geometry = {
+        29, 1, 128, 3, 5, 4, 0, 0, false};
+    const std::size_t elements = static_cast<std::size_t>(geometry.sequence) *
+                                 geometry.heads * geometry.head_dim;
+    const std::size_t tensor_bytes = elements * sizeof(hip_bfloat16);
+    const std::vector<sageattention::q_task> tasks =
+        build_generic_tasks(geometry);
+    CHECK(!tasks.empty());
+    const sageattention::descriptor operation = generic_descriptor(
+        geometry, tasks.size(), sageattention::qk_mode::bf16,
+        sageattention::kernel_id::e33_bf16_qk_gfx12_d128);
+    const std::size_t workspace_bytes =
+        sageattention::workspace_size(operation);
+    CHECK(workspace_bytes > 0);
+    constexpr std::size_t guard_bytes = 4096;
+    constexpr unsigned char guard_value = 0x5a;
+
+    std::vector<hip_bfloat16> q(elements), k(elements), v(elements);
+    for (std::size_t index = 0; index < elements; ++index) {
+        q[index] = hip_bfloat16(static_cast<float>(index % 17) * 0.01f);
+        k[index] = hip_bfloat16(static_cast<float>(index % 19) * -0.01f);
+        v[index] = hip_bfloat16(static_cast<float>(index % 23) * 0.02f);
+    }
+
+    device_buffer dq, dk, dv, guarded_output, guarded_workspace;
+    CHECK(dq.allocate(tensor_bytes) && dk.allocate(tensor_bytes) &&
+          dv.allocate(tensor_bytes) &&
+          guarded_output.allocate(tensor_bytes + 2 * guard_bytes) &&
+          guarded_workspace.allocate(workspace_bytes + 2 * guard_bytes));
+    auto *output = static_cast<unsigned char *>(guarded_output.data) +
+                   guard_bytes;
+    auto *workspace = static_cast<unsigned char *>(guarded_workspace.data) +
+                      guard_bytes;
+    HIP_CHECK(hipMemcpy(dq.data, q.data(), tensor_bytes,
+                        hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(dk.data, k.data(), tensor_bytes,
+                        hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(dv.data, v.data(), tensor_bytes,
+                        hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemset(guarded_output.data, guard_value,
+                        tensor_bytes + 2 * guard_bytes));
+    HIP_CHECK(hipMemset(guarded_workspace.data, guard_value,
+                        workspace_bytes + 2 * guard_bytes));
+
+    hipStream_t stream = nullptr;
+    HIP_CHECK(hipStreamCreate(&stream));
+    const sageattention::params params = {
+        dq.data, dk.data, dv.data, output, operation,
+        1.0f / std::sqrt(128.0f), workspace, workspace_bytes, stream};
+    HIP_CHECK(sageattention::launch(
+        params, {tasks.data(), tasks.size()}));
+    HIP_CHECK(hipStreamSynchronize(stream));
+
+    std::vector<unsigned char> guard(guard_bytes);
+    const auto guard_is_intact = [&guard]() {
+        return std::all_of(guard.begin(), guard.end(), [](unsigned char byte) {
+            return byte == guard_value;
+        });
+    };
+    HIP_CHECK(hipMemcpy(guard.data(), guarded_output.data, guard_bytes,
+                        hipMemcpyDeviceToHost));
+    CHECK(guard_is_intact());
+    HIP_CHECK(hipMemcpy(guard.data(), output + tensor_bytes, guard_bytes,
+                        hipMemcpyDeviceToHost));
+    CHECK(guard_is_intact());
+    HIP_CHECK(hipMemcpy(guard.data(), guarded_workspace.data, guard_bytes,
+                        hipMemcpyDeviceToHost));
+    CHECK(guard_is_intact());
+    HIP_CHECK(hipMemcpy(guard.data(), workspace + workspace_bytes,
+                        guard_bytes, hipMemcpyDeviceToHost));
+    CHECK(guard_is_intact());
+    HIP_CHECK(hipStreamDestroy(stream));
+    std::puts("E33 output/workspace guard canaries: intact");
     return true;
 }
 
@@ -679,12 +952,16 @@ int main() {
         std::fputs("test requires a selected gfx1201/wave32 GPU\n", stderr);
         return EXIT_FAILURE;
     }
-    if (!test_uniform_scores_is_masked_mean() ||
+    if (!test_bf16_wmma_accumulator_layout() ||
+        !test_uniform_scores_is_masked_mean() ||
         !test_manual_generic_interval_plan() ||
         !test_correctness_and_determinism() ||
+        !test_bf16_qk_correctness_and_determinism() ||
         !test_h3_17_frame_misaligned_geometry() ||
         !test_targeted_h3_geometries() ||
+        !test_bf16_qk_targeted_geometries() ||
         !test_output_and_workspace_guards() ||
+        !test_bf16_qk_output_and_workspace_guards() ||
         !test_masked_key_and_value_do_not_leak())
         return EXIT_FAILURE;
     std::puts("gfx12 INT8 QK + BF16 PV generic/H3 SageAttention tests "

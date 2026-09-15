@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "kernel_id": "exact-wave32-bf16-gfx1201-d128",
+  "status": "experimental",
+  "selector": "wave32_exact_reference",
+  "implementation": {
+    "header": "src/sage_attention_portable_reference.hpp",
+    "device": "src/sage_attention_portable_reference.hip",
+    "benchmark": "tests/bench_interval.cpp"
+  },
+  "dispatch": {
+    "gpu_architectures": [
+      "gfx1201"
+    ],
+    "wavefront_size": 32,
+    "layouts": [
+      "NHD"
+    ],
+    "batch_sizes": [
+      1
+    ],
+    "head_dimensions": [
+      128
+    ],
+    "input_dtypes": [
+      "bf16"
+    ],
+    "output_dtypes": [
+      "bf16"
+    ],
+    "mask_plan_classes": [
+      "ordered-interval-v1"
+    ]
+  },
+  "algorithm": {
+    "qk": "bf16-input-fp32-wave32-reduction",
+    "pv": "bf16-input-fp32-accumulate",
+    "softmax": "streaming-fp32-online",
+    "threads_per_query": 32,
+    "head_dimension": 128,
+    "materializes_score_matrix": false,
+    "purpose": "production-representative-exact-performance-baseline"
+  },
+  "validation": {
+    "operator_correctness": "pending-gfx1201-paired-portable-exact",
+    "guard_canaries": "pending-gfx1201",
+    "determinism": "pending-gfx1201",
+    "paired_portable_reference": "pending-gfx1201"
+  },
+  "limitations": [
+    "Benchmark-only baseline; never selected by the public optimized dispatcher.",
+    "Only gfx1201 wave32 and D128 are registered.",
+    "Promotion requires bitwise or explicitly gated agreement with the portable exact oracle."
+  ]
+}

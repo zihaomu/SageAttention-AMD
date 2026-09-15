@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import statistics
+import time
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -187,6 +188,8 @@ def parse_rocm_smi(text: str) -> list[dict[str, Any]]:
         devices.append(
             {
                 "index": int(match.group(1)),
+                "node_id": integer_with_prefix("Node ID"),
+                "pci_bus": (row.get("PCI Bus") or "").lower() or None,
                 "gpu_use_percent": integer_with_prefix("GPU use"),
                 "memory_use_percent": integer_with_prefix(
                     "GPU Memory Allocated"
@@ -198,6 +201,110 @@ def parse_rocm_smi(text: str) -> list[dict[str, Any]]:
     if not devices:
         raise SagectlError("cannot parse physical devices from rocm-smi CSV")
     return devices
+
+
+def select_smi_device_for_hip_ordinal(
+    devices: Sequence[dict[str, Any]], hip_ordinal: int
+) -> dict[str, Any]:
+    """Map HIP's default ordinal order to the corresponding ROCm-SMI card."""
+    if hip_ordinal < 0:
+        raise SagectlError("HIP device ordinal must be non-negative")
+    if any(
+        not isinstance(device.get("node_id"), int)
+        or not isinstance(device.get("pci_bus"), str)
+        for device in devices
+    ):
+        raise SagectlError("rocm-smi omitted Node ID or PCI Bus identity")
+    ordered = sorted(devices, key=lambda device: device["node_id"])
+    node_ids = [device["node_id"] for device in ordered]
+    if len(set(node_ids)) != len(node_ids):
+        raise SagectlError("rocm-smi returned duplicate KFD Node IDs")
+    if hip_ordinal >= len(ordered):
+        raise SagectlError(
+            f"HIP device ordinal {hip_ordinal} was not found; "
+            f"available ordinals: 0..{len(ordered) - 1}"
+        )
+    return ordered[hip_ordinal]
+
+
+def inspect_rocm_smi_devices(rocm_smi: str, operation: str) -> list[dict[str, Any]]:
+    smi = run(
+        [
+            rocm_smi,
+            "--showproductname",
+            "--showuse",
+            "--showmemuse",
+            "--showbus",
+            "--csv",
+        ]
+    )
+    if smi.returncode:
+        raise SagectlError(f"rocm-smi {operation} failed:\n{smi.stdout}")
+    return parse_rocm_smi(smi.stdout)
+
+
+def require_benchmark_device_idle(
+    devices: Sequence[dict[str, Any]],
+    hip_ordinal: int,
+    architecture: str,
+    max_gpu_use: int,
+    max_memory_use: int,
+) -> dict[str, Any]:
+    selected = select_smi_device_for_hip_ordinal(devices, hip_ordinal)
+    if selected["architecture"] != architecture:
+        raise SagectlError("selected GPU architecture does not match platform record")
+    gpu_use = selected["gpu_use_percent"]
+    memory_use = selected["memory_use_percent"]
+    if (
+        gpu_use is None
+        or memory_use is None
+        or gpu_use > max_gpu_use
+        or memory_use > max_memory_use
+    ):
+        raise SagectlError(
+            f"selected GPU is not idle enough: use={gpu_use}% memory={memory_use}%"
+        )
+    return selected
+
+
+def wait_for_benchmark_device_idle(
+    rocm_smi: str,
+    operation: str,
+    hip_ordinal: int,
+    architecture: str,
+    max_gpu_use: int,
+    max_memory_use: int,
+    retries: int,
+    retry_delay_seconds: float,
+) -> tuple[dict[str, Any], int]:
+    """Wait through a bounded SMI sampling tail between campaign trials."""
+    if retries < 0 or retry_delay_seconds < 0:
+        raise SagectlError("idle retry count and delay must be non-negative")
+    expected_bdf: str | None = None
+    for attempt in range(retries + 1):
+        devices = inspect_rocm_smi_devices(rocm_smi, operation)
+        selected = select_smi_device_for_hip_ordinal(devices, hip_ordinal)
+        if selected["architecture"] != architecture:
+            raise SagectlError(
+                "selected GPU architecture does not match platform record"
+            )
+        if expected_bdf is None:
+            expected_bdf = selected["pci_bus"]
+        elif selected["pci_bus"] != expected_bdf:
+            raise SagectlError("HIP ordinal mapping changed while waiting for idle GPU")
+        gpu_use = selected["gpu_use_percent"]
+        memory_use = selected["memory_use_percent"]
+        if gpu_use is None or memory_use is None:
+            raise SagectlError("selected GPU utilization is unavailable")
+        if gpu_use <= max_gpu_use and memory_use <= max_memory_use:
+            return selected, attempt + 1
+        if attempt == retries:
+            raise SagectlError(
+                "selected GPU is not idle enough after "
+                f"{attempt + 1} poll(s): use={gpu_use}% memory={memory_use}%"
+            )
+        time.sleep(retry_delay_seconds)
+    raise AssertionError("unreachable idle wait state")
 
 
 HIP_PROBE_SOURCE = r"""
@@ -248,8 +355,8 @@ def hip_runtime_probe(
         if compiled.returncode:
             raise SagectlError(f"minimal HIP probe compilation failed:\n{compiled.stdout}")
         environment = os.environ.copy()
-        environment["ROCR_VISIBLE_DEVICES"] = str(gpu_index)
-        environment["HIP_VISIBLE_DEVICES"] = "0"
+        environment.pop("ROCR_VISIBLE_DEVICES", None)
+        environment["HIP_VISIBLE_DEVICES"] = str(gpu_index)
         executed = run([str(binary)], env=environment)
         if executed.returncode:
             raise SagectlError(f"minimal HIP runtime probe failed:\n{executed.stdout}")
@@ -334,8 +441,14 @@ def write_canonical_json(path: Path, record: dict[str, Any], force: bool) -> Non
     path = ensure_inside_repository(path)
     if path.exists() and not force:
         raise SagectlError(f"refusing to overwrite existing file without --force: {path}")
+    try:
+        serialized = json.dumps(
+            record, indent=2, ensure_ascii=False, allow_nan=False
+        ) + "\n"
+    except (TypeError, ValueError) as exc:
+        raise SagectlError(f"cannot serialize canonical JSON: {exc}") from exc
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(record, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    path.write_text(serialized, encoding="utf-8")
 
 
 def load_registry_record(category: str, record_id: str) -> dict[str, Any]:
@@ -725,32 +838,26 @@ def benchmark_command(args: argparse.Namespace) -> int:
     if selector not in {
         "automatic_select",
         "e27_gfx12_d128",
+        "e33_bf16_qk_gfx12_d128",
         "portable_exact_reference",
+        "wave32_exact_reference",
     }:
         raise SagectlError(f"kernel record has no supported public selector: {selector!r}")
 
     rocm_path = Path(args.rocm_path)
     rocm_smi = command_path("rocm-smi", rocm_path)
-    smi = run([rocm_smi, "--showproductname", "--showuse", "--showmemuse", "--csv"])
-    if smi.returncode:
-        raise SagectlError(f"rocm-smi preflight failed:\n{smi.stdout}")
-    devices = parse_rocm_smi(smi.stdout)
-    selected = next((device for device in devices if device["index"] == args.gpu), None)
-    if selected is None:
-        raise SagectlError(f"physical GPU {args.gpu} was not found")
-    if selected["architecture"] != platform_record["gpu"]["architecture"]:
-        raise SagectlError("selected GPU architecture does not match platform record")
-    gpu_use = selected["gpu_use_percent"]
-    memory_use = selected["memory_use_percent"]
-    if (
-        gpu_use is None
-        or memory_use is None
-        or gpu_use > args.max_gpu_use
-        or memory_use > args.max_memory_use
-    ):
-        raise SagectlError(
-            f"selected GPU is not idle enough: use={gpu_use}% memory={memory_use}%"
-        )
+    idle_retries = getattr(args, "idle_retries", 5)
+    idle_retry_delay = getattr(args, "idle_retry_delay", 1.0)
+    selected, preflight_polls = wait_for_benchmark_device_idle(
+        rocm_smi,
+        "preflight",
+        args.gpu,
+        platform_record["gpu"]["architecture"],
+        args.max_gpu_use,
+        args.max_memory_use,
+        idle_retries,
+        idle_retry_delay,
+    )
 
     tasks = generate_interval_tasks(workload_record)
     plan_path = ROOT / "build" / "sagectl" / "plans" / f"{args.workload}.plan"
@@ -771,6 +878,22 @@ def benchmark_command(args: argparse.Namespace) -> int:
     if built.returncode:
         raise SagectlError(f"generic interval benchmark build failed:\n{built.stdout}")
 
+    launch_selected, launch_preflight_polls = wait_for_benchmark_device_idle(
+        rocm_smi,
+        "launch preflight",
+        args.gpu,
+        platform_record["gpu"]["architecture"],
+        args.max_gpu_use,
+        args.max_memory_use,
+        idle_retries,
+        idle_retry_delay,
+    )
+    if launch_selected["pci_bus"] != selected["pci_bus"]:
+        raise SagectlError("HIP ordinal mapping changed between benchmark preflights")
+    selected = launch_selected
+    gpu_use = selected["gpu_use_percent"]
+    memory_use = selected["memory_use_percent"]
+
     shape = workload_record["shape"]
     runner_command = [
         str(ROOT / benchmark_target),
@@ -782,14 +905,17 @@ def benchmark_command(args: argparse.Namespace) -> int:
         selector,
     ]
     environment = os.environ.copy()
-    environment["ROCR_VISIBLE_DEVICES"] = str(args.gpu)
-    environment["HIP_VISIBLE_DEVICES"] = "0"
+    environment.pop("ROCR_VISIBLE_DEVICES", None)
+    environment["HIP_VISIBLE_DEVICES"] = str(args.gpu)
+    environment["SAGEATTENTION_EXPECTED_GPU_BDF"] = selected["pci_bus"]
     measured = run(runner_command, env=environment)
     if measured.returncode:
         raise SagectlError(f"generic interval benchmark failed:\n{measured.stdout}")
     runner_result = parse_runner_json(measured.stdout)
     if not runner_result["architecture"].startswith(architecture):
         raise SagectlError("benchmark runtime architecture differs from platform record")
+    if runner_result.get("pci_bus", "").lower() != selected["pci_bus"]:
+        raise SagectlError("benchmark runtime BDF differs from preflighted HIP device")
 
     revision, source_dirty = git_source_state()
     recorded_at = dt.datetime.now().astimezone()
@@ -810,8 +936,13 @@ def benchmark_command(args: argparse.Namespace) -> int:
         "workload_id": args.workload,
         "session": {
             "physical_device_index": args.gpu,
+            "rocm_smi_index": selected["index"],
+            "pci_bus": selected["pci_bus"],
             "gpu_use_percent_before": gpu_use,
             "gpu_memory_percent_before": memory_use,
+            "idle_preflight_polls": preflight_polls,
+            "launch_idle_preflight_polls": launch_preflight_polls,
+            "idle_retry_delay_seconds": idle_retry_delay,
             "command": (
                 f"./tools/sagectl benchmark --gpu {args.gpu} "
                 f"--platform {platform_id} --kernel {kernel_id} "
@@ -838,6 +969,22 @@ def benchmark_command(args: argparse.Namespace) -> int:
             "cpu_max_abs": runner_result["correctness"]["cpu_max_abs"],
             "cpu_relative_rmse": runner_result["correctness"][
                 "cpu_relative_rmse"
+            ],
+            "paired_reference": runner_result["correctness"][
+                "paired_reference"
+            ],
+            "paired_max_abs": runner_result["correctness"][
+                "paired_max_abs"
+            ],
+            "paired_relative_rmse": runner_result["correctness"][
+                "paired_relative_rmse"
+            ],
+            "paired_cosine": runner_result["correctness"]["paired_cosine"],
+            "paired_non_finite": runner_result["correctness"][
+                "paired_non_finite"
+            ],
+            "paired_reference_hash": runner_result["correctness"][
+                "paired_reference_hash"
             ],
         },
     }
@@ -960,7 +1107,14 @@ def invoke_benchmark(
 
 def trial_passes_gates(summary: dict[str, Any], gates: dict[str, Any]) -> bool:
     correctness = summary.get("correctness", {})
-    if correctness.get("non_finite") != 0:
+    if not isinstance(correctness, dict):
+        return False
+    non_finite = correctness.get("non_finite")
+    if (
+        isinstance(non_finite, bool)
+        or not isinstance(non_finite, int)
+        or non_finite != 0
+    ):
         return False
     if gates.get("require_determinism") and correctness.get("deterministic") is not True:
         return False
@@ -968,7 +1122,54 @@ def trial_passes_gates(summary: dict[str, Any], gates: dict[str, Any]) -> bool:
         return False
     if gates.get("require_cpu_reference") and correctness.get("cpu_reference") != "pass":
         return False
+    max_paired_relative_rmse = gates.get("max_paired_relative_rmse")
+    min_paired_cosine = gates.get("min_paired_cosine")
+    if max_paired_relative_rmse is not None or min_paired_cosine is not None:
+        if correctness.get("paired_reference") not in {"pass", "self"}:
+            return False
+        paired_non_finite = correctness.get("paired_non_finite")
+        if (
+            isinstance(paired_non_finite, bool)
+            or not isinstance(paired_non_finite, int)
+            or paired_non_finite != 0
+        ):
+            return False
+    if max_paired_relative_rmse is not None:
+        relative_rmse = correctness.get("paired_relative_rmse")
+        if (
+            isinstance(relative_rmse, bool)
+            or not isinstance(relative_rmse, (int, float))
+            or not math.isfinite(relative_rmse)
+            or relative_rmse > max_paired_relative_rmse
+        ):
+            return False
+    if min_paired_cosine is not None:
+        cosine = correctness.get("paired_cosine")
+        if (
+            isinstance(cosine, bool)
+            or not isinstance(cosine, (int, float))
+            or not math.isfinite(cosine)
+            or cosine < min_paired_cosine
+        ):
+            return False
     return True
+
+
+def objective_metric_ms(summary: dict[str, Any], metric: str) -> float:
+    metrics = summary.get("metrics_ms")
+    if not isinstance(metrics, dict):
+        raise SagectlError("benchmark summary metrics_ms must be an object")
+    value = metrics.get(metric)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0.0
+    ):
+        raise SagectlError(
+            f"benchmark objective metric {metric} must be a finite positive number"
+        )
+    return float(value)
 
 
 def geometric_mean(values: Sequence[float]) -> float:
@@ -997,7 +1198,9 @@ def run_static_campaign_gates(campaign: dict[str, Any]) -> list[dict[str, str]]:
             *campaign["candidate_kernel_ids"],
         ]
     }
-    if "e27_gfx12_d128" in selectors:
+    if selectors.intersection(
+        {"e27_gfx12_d128", "e33_bf16_qk_gfx12_d128"}
+    ):
         commands.append([*make_prefix, "isa"])
     records: list[dict[str, str]] = []
     for command in commands:
@@ -1040,7 +1243,7 @@ def search_command(args: argparse.Namespace) -> int:
         )
         if not trial_passes_gates(baseline, gates):
             raise SagectlError(f"baseline failed campaign gates: {workload_id}")
-        short_baselines[workload_id] = baseline["metrics_ms"][metric]
+        short_baselines[workload_id] = objective_metric_ms(baseline, metric)
         trials.append(
             {
                 "stage": "short",
@@ -1067,7 +1270,7 @@ def search_command(args: argparse.Namespace) -> int:
             )
             gate_pass = trial_passes_gates(candidate, gates)
             passed = passed and gate_pass
-            candidate_metric = candidate["metrics_ms"][metric]
+            candidate_metric = objective_metric_ms(candidate, metric)
             speedup = short_baselines[workload_id] / candidate_metric
             speedups.append(speedup)
             trials.append(
@@ -1114,7 +1317,7 @@ def search_command(args: argparse.Namespace) -> int:
             )
             if not trial_passes_gates(baseline, gates):
                 raise SagectlError("confirmation baseline failed campaign gates")
-            baseline_metric = baseline["metrics_ms"][metric]
+            baseline_metric = objective_metric_ms(baseline, metric)
             trials.append(
                 {
                     "stage": "confirmation",
@@ -1139,7 +1342,7 @@ def search_command(args: argparse.Namespace) -> int:
                     raise SagectlError(
                         f"confirmation candidate failed gates: {kernel_id}"
                     )
-                speedup = baseline_metric / candidate["metrics_ms"][metric]
+                speedup = baseline_metric / objective_metric_ms(candidate, metric)
                 confirmed_speedups[kernel_id].append(speedup)
                 trials.append(
                     {
@@ -1246,14 +1449,8 @@ def doctor(args: argparse.Namespace) -> int:
     rocm_path = Path(args.rocm_path)
     hipcc = command_path("hipcc", rocm_path)
     rocm_smi = command_path("rocm-smi", rocm_path)
-    smi = run([rocm_smi, "--showproductname", "--showuse", "--showmemuse", "--csv"])
-    if smi.returncode:
-        raise SagectlError(f"rocm-smi probe failed:\n{smi.stdout}")
-    devices = parse_rocm_smi(smi.stdout)
-    selected = next((device for device in devices if device["index"] == args.gpu), None)
-    if selected is None:
-        available = ", ".join(str(device["index"]) for device in devices)
-        raise SagectlError(f"physical GPU {args.gpu} not found; available: {available}")
+    devices = inspect_rocm_smi_devices(rocm_smi, "probe")
+    selected = select_smi_device_for_hip_ordinal(devices, args.gpu)
 
     hipcc_version = run([hipcc, "--version"])
     if hipcc_version.returncode:
@@ -1296,6 +1493,8 @@ def doctor(args: argparse.Namespace) -> int:
     )
     summary = {
         "selected_physical_gpu": args.gpu,
+        "selected_rocm_smi_index": selected["index"],
+        "selected_pci_bus": selected["pci_bus"],
         "gpu_use_percent": gpu_use,
         "memory_use_percent": memory_use,
         "benchmark_ready": benchmark_ready,
@@ -1317,7 +1516,9 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_parser = subparsers.add_parser(
         "doctor", help="probe one explicit AMD GPU and generate a platform draft"
     )
-    doctor_parser.add_argument("--gpu", type=int, required=True, help="physical GPU index")
+    doctor_parser.add_argument(
+        "--gpu", type=int, required=True, help="host HIP device ordinal"
+    )
     doctor_parser.add_argument(
         "--rocm-path", default=str(DEFAULT_ROCM_PATH), help="ROCm installation prefix"
     )
@@ -1341,7 +1542,9 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark_parser = subparsers.add_parser(
         "benchmark", help="run a registry-driven generic interval benchmark"
     )
-    benchmark_parser.add_argument("--gpu", type=int, required=True)
+    benchmark_parser.add_argument(
+        "--gpu", type=int, required=True, help="host HIP device ordinal"
+    )
     benchmark_parser.add_argument("--platform", required=True)
     benchmark_parser.add_argument("--kernel", required=True)
     benchmark_parser.add_argument("--workload", required=True)
@@ -1351,12 +1554,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     benchmark_parser.add_argument("--max-gpu-use", type=int, default=5)
     benchmark_parser.add_argument("--max-memory-use", type=int, default=1)
+    benchmark_parser.add_argument("--idle-retries", type=int, default=5)
+    benchmark_parser.add_argument("--idle-retry-delay", type=float, default=1.0)
     benchmark_parser.set_defaults(function=benchmark_command)
 
     baseline_parser = subparsers.add_parser(
         "baseline", help="qualify and benchmark the registered portable exact baseline"
     )
-    baseline_parser.add_argument("--gpu", type=int, required=True)
+    baseline_parser.add_argument(
+        "--gpu", type=int, required=True, help="host HIP device ordinal"
+    )
     platform_group = baseline_parser.add_mutually_exclusive_group(required=True)
     platform_group.add_argument("--platform")
     platform_group.add_argument(
@@ -1374,7 +1581,9 @@ def build_parser() -> argparse.ArgumentParser:
     search_parser = subparsers.add_parser(
         "search", help="execute a validated optimization campaign"
     )
-    search_parser.add_argument("--gpu", type=int, required=True)
+    search_parser.add_argument(
+        "--gpu", type=int, required=True, help="host HIP device ordinal"
+    )
     search_parser.add_argument("--campaign", required=True)
     search_parser.add_argument(
         "--rocm-path", default=str(DEFAULT_ROCM_PATH), help="ROCm installation prefix"

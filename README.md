@@ -13,12 +13,14 @@ dependency.
 
 ## What is implemented
 
-The current E27 specialization supports:
+The current gfx1201 specializations support:
 
 - caller-provided ordered-interval plans independent of model geometry;
 - BF16 NHD input/output, batch 1, dynamic sequence/head count, `D=128`;
-- symmetric signed INT8 Q/K quantization with 32-row Q and 64-row K groups;
-- gfx12 wave32 `v_wmma_i32_16x16x16_iu8` QK;
+- E27 symmetric signed INT8 Q/K quantization with 32-row Q and 64-row K groups;
+- E27 gfx12 wave32 `v_wmma_i32_16x16x16_iu8` QK;
+- experimental E33 BF16 Q/K WMMA with FP32 accumulation and compensated
+  `BF16 high + BF16 residual` PV;
 - sparse attention represented as ordered key intervals per Q super-tile;
 - the H3 VDN `window + chunk + bidirectional anchors + global tokens` planner;
 - streaming FP32 online softmax without an `S x S` score or mask buffer;
@@ -41,8 +43,9 @@ generality.
 
 The generic API accepts raw device pointers, a HIP stream, an operation
 descriptor, caller-owned workspace, and an ordered-interval plan. H3 geometry
-is converted into that plan by the compatibility adapter. The E27 hot kernel
-remains specialized and receives the same task layout as the v0.1 release.
+is converted into that plan by the compatibility adapter. The E27 and E33 hot
+kernels remain separate specializations and receive the same ordered task
+layout; E33 is generic-API only until H3 downstream quality gates pass.
 
 ## Capability and evidence model
 
@@ -60,10 +63,10 @@ mode. A measurement on one tuple is never treated as evidence for another.
   measured session and source commit.
 
 Run `make metadata-check` to validate references and compatibility. The current
-validated tuple is R9700/gfx1201 wave32 on ROCm 7.2.3 with the experimental E27
-ordered-interval `D=128` specialization and H3 VDN workload. Registry presence
-does not by itself mean a kernel is a stable default; status and downstream
-quality are recorded separately.
+validated tuple is R9700/gfx1201 wave32 on ROCm 7.2.3 with experimental E27 and
+E33 ordered-interval `D=128` specializations and the H3 VDN workload. Registry
+presence does not by itself mean a kernel is a stable default; status and
+downstream quality are recorded separately.
 
 ## Build
 
@@ -100,8 +103,9 @@ make isa
 H3_PHYSICAL_GPU=4 make bench
 ```
 
-The recipes expose only the selected HSA agent with `ROCR_VISIBLE_DEVICES`,
-then address it as HIP device 0. Use a confirmed idle card for performance
+`H3_PHYSICAL_GPU` is the host HIP ordinal. The recipes expose that ordinal with
+`HIP_VISIBLE_DEVICES`; `sagectl` maps KFD node order to the ROCm-SMI card and
+records the resolved PCI BDF. Use a confirmed idle card for performance
 measurements.
 
 ### Machine onboarding and optimization campaigns
@@ -119,6 +123,8 @@ make tool-test metadata-check
   --workload ordered-interval-dense-s35-h1-d128
 ./tools/sagectl search --gpu 4 \
   --campaign gfx1201-ordered-interval-d128-smoke
+./tools/sagectl search --gpu 4 \
+  --campaign gfx1201-h3-vdn-e33-bf16-qk
 ./tools/sagectl report \
   --campaign gfx1201-ordered-interval-d128-smoke
 ```
@@ -213,11 +219,16 @@ The H3 integration therefore keeps exact BF16 wave32 as `auto` and exposes
 E27 only through explicit `H3_VDN_SDPA=sage-i8-bf16` selection. Operator speed
 must not be presented as model-level acceptance.
 
+E33 is an upstream experimental candidate, not an H3 default. Its BF16-QK and
+compensated-BF16-PV path must first receive immutable clean-commit evidence,
+then pass H3 prompt-2 50-layer, 8-NFE, and three-prompt media gates under a new
+explicit mode. Until then, H3's E27 and exact behavior is unchanged.
+
 ## Repository layout
 
 ```text
 include/   experimental public C++/HIP API
-src/       generic dispatch/workspace, H3 planner, and gfx12 E27 kernel
+src/       generic dispatch/workspace, H3 planner, and gfx12 E27/E33 kernels
 tests/     CPU contracts, GPU correctness/canaries, benchmark
 doc/       requirements, optimization ledger, decisions, H3 integration
 registry/  platform, kernel, and workload capability records

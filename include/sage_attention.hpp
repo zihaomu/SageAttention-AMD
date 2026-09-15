@@ -22,6 +22,7 @@ enum class data_type : std::uint32_t {
 
 enum class qk_mode : std::uint32_t {
     symmetric_i8 = 0,
+    bf16 = 1,
 };
 
 enum class pv_mode : std::uint32_t {
@@ -33,11 +34,13 @@ enum class pv_mode : std::uint32_t {
 enum class kernel_id : std::uint32_t {
     automatic_select = 0,
     e27_gfx12_d128 = 1,
+    e33_bf16_qk_gfx12_d128 = 2,
 };
 
 /* Logical tensor shape. NHD means [batch, sequence, heads, head_dimension].
- * The current E27 specialization requires batch 1, self-attention, equal Q/KV
- * head counts, and D=128. Separate fields preserve the generic API boundary. */
+ * The current gfx12 specializations require batch 1, self-attention, equal
+ * Q/KV head counts, and D=128. Separate fields preserve the generic API
+ * boundary. */
 struct tensor_shape {
     std::uint32_t batch;
     std::uint32_t query_sequence;
@@ -62,7 +65,7 @@ struct key_interval {
 };
 
 /* All rows in one task share the same ordered, non-overlapping set of allowed
- * key intervals. The current E27 specialization accepts 1..32 query rows and
+ * key intervals. Current specializations accept 1..32 query rows and
  * 1..max_intervals_per_task intervals per task. */
 struct q_task {
     std::uint32_t q_begin;
@@ -104,8 +107,8 @@ struct profile {
     float total_ms;
 };
 
-/* Host-only validation. Unsupported but structurally valid E27 combinations
- * return hipErrorNotSupported; malformed values return hipErrorInvalidValue. */
+/* Host-only validation. Unsupported but structurally valid combinations return
+ * hipErrorNotSupported; malformed values return hipErrorInvalidValue. */
 hipError_t validate_descriptor(const descriptor &operation);
 
 /* Validates exact Q-row coverage, task geometry, interval order, and bounds. */

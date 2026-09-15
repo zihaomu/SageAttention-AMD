@@ -30,6 +30,28 @@ hipError_t launch_portable_exact(
     float scale,
     hipStream_t stream);
 
+/* gfx wave32 exact-BF16 performance baseline. It preserves the portable
+ * oracle's D=128 reduction and online-softmax order while using one wave per
+ * query/head. It is benchmark-only and is never selected by the public
+ * optimized dispatcher. */
+hipError_t query_wave32_exact_support(
+    std::uint32_t query_sequence,
+    std::uint32_t query_heads,
+    std::uint32_t head_dimension);
+
+hipError_t launch_wave32_exact(
+    const void *query_bf16,
+    const void *key_bf16,
+    const void *value_bf16,
+    void *output_bf16,
+    const q_task *device_tasks,
+    std::size_t task_count,
+    std::uint32_t sequence,
+    std::uint32_t heads,
+    std::uint32_t head_dimension,
+    float scale,
+    hipStream_t stream);
+
 }  // namespace sageattention::reference
 
 #endif

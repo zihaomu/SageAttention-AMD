@@ -1230,3 +1230,269 @@ exit 0、concurrency guard 为空且输出 finite。完整下游 diff 已保存�
 因此 Q8/K16、smooth-K 和新增 layer/NFE 调度只作为失败证据保留，全部从 H3 runtime
 清理。后续 Sage kernel 研究在本仓库完成并先通过 registry/operator 门禁，H3 只接入
 固定提交并执行模型级质量验证。
+
+## 13. E33 BF16-QK/F32-accumulate WMMA（IN PROGRESS）
+
+2026-09-14 启动。E27 三 prompt audio promotion 为 0/3；E31 证明只恢复逐 key
+softmax state 几乎不改变误差，E32 和下游 P9 又排除了 head/layer/NFE overlay、
+Q8/K16 与 smooth-K。下一项不重复这些混合规则，而是完全移除 Q/K INT8 量化：
+直接以 BF16 Q/K 进入 gfx12 WMMA，以 F32 累加 QK，保留 F32 online softmax 与现有
+BF16-PV/F32-accumulate WMMA。
+
+实验假设：Q/K 本来就是 BF16，取消 groupwise INT8 往返应显著降低 E27 的 operator
+误差和下游 audio 漂移；固定的 Apache-2.0
+`alexhegit/h3-hip.c@377ad3698d9d82fdb9ab5a22afc9fdc2c521adc3` 已给出 gfx12
+BF16 WMMA fragment 映射和 dense fused attention 的可行证据。这里新增独立的 E33
+`qk_mode`/`kernel_id`，适配本仓库 ordered-interval task ABI；不得改变 E27 或把 E33
+静默接到 automatic/default。
+
+预先冻结的快速失败条件：
+
+- host descriptor、registry、manual interval/tail/mask、canary、determinism、finite
+  和 BF16 WMMA ISA 全部通过；正式 GPU 仅允许物理 GPU 4/BDF `e3:00.0`。
+- production-shaped synthetic relative RMSE 必须严格低于 E27 `0.361013%`，cosine
+  必须高于 `0.999993586`；否则不进入 H3。
+- 含税 operator 中位必须保留完整 E2E 至少 10% 的合理潜力；profile 明确报告
+  Q/K quant 为 0、attention 与 total。
+- 上游通过后才允许 H3 固定提交并增加显式 mode；prompt 2 依次通过 50 层 audio
+  `<=5%`/`>=0.999`、8-NFE video/audio `<=5%`/`>=0.999`，再进入三 prompt media。
+- 任一级失败先记录结果再清理候选；stable/`auto` 始终保持 exact wave32。
+
+当前状态：已完成重复路线与固定参考审计，正在实现 generic API/registry 和独立 E33
+device dispatch，尚未运行 GPU。
+
+实时记录：generic API 已新增独立 E33 registration；E33 workspace 只分配 task
+metadata，E27 仍保留 Q/K I8 与 scale；首个 rocWMMA 实现已无 warning 编译，registry
+3 kernels、9 项 tool tests、host contract 和 gfx12 BF16 WMMA ISA 检查通过。第一次
+GPU4 试跑被守护脚本因 17% load、17,075 MiB used VRAM 拒绝，没有使用其它 GPU；
+等待空闲期间继续补 production benchmark 与 E33 canary。
+
+host/静态实现已进一步收口：`bench_interval`、production H3-shape benchmark 和
+campaign CLI 均能显式选择 E33；新增独立 active campaign，不复写历史 E27 result。
+E33 output/workspace canary、manual interval、task tail、multi-interval、极端分数和
+determinism 已接入 GPU test。静态 code-object 为 185 VGPR、38 SGPR、18,432 B LDS、
+0 scratch/0 spill；`make isa` 会在 E33 自身 symbol 内确认 BF16 WMMA，而不再由 E27
+已有的 BF16-PV 指令误通过。第二/三次 GPU4 守护仍因外部 workload 拒绝启动，未共享
+或改用其它 GPU。
+
+H3 另以 `SAGEATTENTION_DIR` 指向本工作仓库完成纯编译验证：既有 E27 bridge、三份
+runtime object、H3 SDPA benchmark 和 22 项 mode contract 无 warning/error，说明
+新增 generic enum/registration 保持 source compatible。该步骤没有运行 GPU，也不算
+E33 下游质量证据；H3 gitlink 仍固定旧的 `18d9490`。
+
+本轮共五次通过 H3 GPU4 守护尝试上游 correctness；观测 load 为
+17%/16%/28%/92%/30%，used VRAM 均为 17,075 MiB，全部在启动前安全拒绝。当前 E33
+源码保持未提交研究状态，registry validation 仍为 `pending`，不会在没有 GPU 证据时
+提交、更新 H3 gitlink 或宣称通过。
+
+随后从空 `build/` 完成全量重建，library、CPU/GPU tests、两个 benchmark 均无
+warning/error；registry/tool/contract/ISA 再次通过。E33 registration 与 registry
+已收窄为实际待验证的 gfx1201，不预先声明 gfx1200 支持。
+
+第三个连续工作轮次复核时，物理 GPU 4 仍为 36% load、52% VRAM，同一外部训练进程
+持续存活约 4.6 小时。由于 H3 明确只允许使用这一张物理卡且要求空卡运行，当前 E33
+状态改为 **BLOCKED / GPU4 WAIT**：不得跳过 dirty correctness 去提交，不得提前更新
+H3 gitlink，也不得用 host/ISA 结果替代 GPU/operator 结果。解除条件是 GPU4 空闲；
+恢复后第一条命令仍由 H3 守护执行小几何 E33 smoke，随后才是完整 GPU test 和 clean
+paired campaign。
+
+用户恢复任务后，E33 重新进入 **IN PROGRESS / GPU4 WAIT**。等待窗口期间补齐了同一
+进程、同一组输入的 production operator 配对质量门禁：候选计时和输出拷回完成后，
+再单独运行 portable exact BF16 参考，因此参考计算不进入候选 event/wall 计时；结果
+记录 candidate/reference hash、max-abs、relative RMSE、cosine 和 non-finite。active
+campaign 将 E27 的 `0.361013%/0.999993586` 作为必须严格改善的边界，实际阈值冻结为
+relative RMSE `<=0.00361012`、cosine `>=0.999993587`。portable baseline 以 `self`
+记录 `0/1`，E33 必须以 `pass` 和独立 reference hash 通过，不能靠缺字段或 skipped
+状态进入确认轮。
+
+该改动已通过无 warning 的 library/tests/benchmarks 增量构建、registry validation
+（1 platform/3 kernels/2 workloads/2 campaigns/1 historical result）、9 项 CLI unit
+tests、generic/H3 host contract、E33 symbol 内 BF16 WMMA ISA 检查和
+`git diff --check`。这些仍只是 host/静态证据；下一步继续由 H3 GPU4 守护器先执行
+最小 E33 smoke，GPU4 未空闲时不会启动任何 ROCm workload。
+
+首次恢复试跑又发现并修正了 benchmark 编排自身的设备编号缺陷：本机默认 HIP
+ordinal 4 对应 BDF `0000:e3:00.0`、ROCm-SMI `card7`，不能假设 HIP ordinal 等于
+ROCm-SMI card index。`sagectl` 现在按 KFD Node ID 排序完成 HIP ordinal→BDF→SMI
+映射，launch 仅设置 `HIP_VISIBLE_DEVICES=4`；runner 在任何 allocation/kernel 前用
+`hipDeviceGetPCIBusId` 对照预检 BDF，并把 HIP ordinal、SMI index 和 BDF 都写入结果。
+unit test 覆盖乱序 card/node 映射。第一次错误预检只查询到另一张卡忙并退出，没有
+启动 E33；修正后 H3 外层守护与 Sage 内层预检都确认目标 BDF 空闲。
+
+随后在唯一 GPU4/BDF `0000:e3:00.0` 真正执行 `S=35/H=1/D=128` dense E33 smoke。
+设备、guard canary、determinism 和 finite 全部通过，Q/K quant 均为精确 `0`；但输出
+hash `1abf5420497fe253` 对 portable exact hash `aa9d63ae3b607444`，CPU relative RMSE
+`0.171558262`，paired relative RMSE `0.171518882528`、cosine `0.985181681264`、
+max-abs `0.0354003906`。这远超冻结阈值，故本次 operator gate 为 **FAIL / DEBUG**；
+`0.038519 ms` 小几何计时不具备可接受性能含义，停止 full GPU test 和 production
+campaign。下一步只用小几何/逐元素 oracle 定位 BF16 WMMA fragment、score-to-row
+或 PV 映射，修复后从同一 smoke 重新开始。
+
+映射探针给出确定根因：gfx1201/ROCm 7.2 的 `16x16x16 BF16→F32` accumulator
+为 `column=lane&15`、`row=element+8*(lane>>4)`，而固定 alex 参考注释记录的是其
+gfx1151 环境的 `row=2*element+(lane>>4)`。`store_matrix_sync` 还原出的 16x16
+矩阵 256/256 正确，证明 QK/PV 指令和 load layout 没错；错误仅在直接读取 `.x[]`
+时把 224/256 个 register element 归到了错误 query row。E33 已同步修正 score、
+probability LDS row、online-softmax alpha 和最终 output row，并把 identity-matrix×
+unique-matrix 的 probe 纳入 GPU test，防止以后 ROCm/架构变化静默破坏该非保证布局。
+
+修正后同一 GPU4 完整 upstream GPU test 通过：fragment stored/raw mismatch 均为 0；
+uniform/manual interval E33 max-abs 为 `0.0001877993`；一般 BF16-QK case relative RMSE
+`0.007579086`、cosine `0.999971287`，四组 tail/one-key/multi-interval/extreme case、
+两套 output/workspace canary、finite 和 determinism 全部 PASS。随后再次运行 S=35
+同进程 paired smoke，candidate/exact hash 为 `6d98b9ffa39f53b3`/
+`aa9d63ae3b607444`，paired max-abs `0.000244140625`、relative RMSE
+`0.00318462988123`、cosine `0.999994935002`，首次通过严格改善 E27 的 operator
+质量边界；Q/K quant 继续为 0。当前进入 production `S=5338/H=56/D=128` 配对门禁，
+尚未据小几何时间作 promotion。
+
+production paired operator 随后完成，结果为 **FAIL / ANALYZE**：candidate/exact
+hash `34e106d93b3948e2`/`4c9447152b73ee7b`，max-abs `1.62124634e-05`、relative
+RMSE `0.00721170082378`、cosine `0.99997399748`，虽然 finite、determinism 和 canary
+全通过，但数值反而差于 E27 `0.00361013/0.999993586`，未满足冻结的严格改善门禁。
+E33 profile quant 为 0/0，attention/profile total/event median 为
+`89.459175/89.468414/90.084526 ms`，也远慢于 GPU4 E27 的约 `15.121 ms`。该轮为
+dirty research evidence，不能 promotion；按 staged gate 不提交、不更新 H3 gitlink、
+不运行 50 层。下一步只做 E27/E33 的 online-softmax tile、BF16 probability 舍入、
+rocWMMA load/fragment transform和双 wave task 粒度差分；若没有同时改善质量与性能的
+明确结构修复，E33 直接记录 REJECT 并清理。
+
+源码差分后实现 E33-R1 raw-WMMA：不再把 Q/K/V/P 逐 tile 搬到 LDS，也不走
+rocWMMA fragment transform；改为以 `K @ Q^T` 生成与 E27 相同的“lane=query、
+element=key”score 状态，并复用 E27 已验证的 probability/PV raw fragment。第一次
+loader 把 probability 专用转置错误复用到 QK，uniform 因 score 恒零仍通过、一般
+case relative RMSE `0.6551512`，被 GPU gate 立即拦截；按 A/B 原始布局重新推导为
+“固定 key/query row + swizzled depth”后，完整 GPU suite 恢复全通过，未带着错误
+loader 进入 production。
+
+E33-R1 production 配对表明性能根因已经消除但候选仍未达标：attention/profile
+total/event median 从 rocWMMA-LDS 版 `89.459/89.468/90.085 ms` 降为
+`15.923/15.933/16.010 ms`，约降低 82%，但仍比 GPU4 E27 的
+`14.892/15.121 ms` 慢约 7.0%/5.9%。paired relative RMSE/cosine 保持
+`0.00721169770564/0.999973997503`，证实 0.72% 误差不是 rocWMMA transform，而是
+共享的 BF16 probability/online normalization 轨迹；candidate hash 变为
+`57185fcc02a085b4`，exact hash 不变。下一最小可证伪变体只让 denominator 累加实际
+送入 PV 的 BF16-rounded probability，而不是未舍入 F32 probability，使 numerator
+和 normalization 使用同一权重；若仍不能严格优于 E27，则停止 E33。
+
+E33-R2 rounded-denominator 已快速否决。完整 GPU suite 仍通过，但 production paired
+relative RMSE 仅从 `0.00721169770564` 变为 `0.00721133714881`，cosine 只变为
+`0.999973999049`；profile/event 反而为 `15.965/16.150 ms`。这不是可用改善，分母
+恢复累加原始 F32 probability。最后一个有明确数值机制的 E33-R3 将 probability
+分解为 `BF16 hi + BF16 residual`，对同一 V 做两次 PV WMMA、F32 累加，从而使
+numerator 近似原始 F32 probability；若它仍不能过 `0.00361012/0.999993587` 或
+失去至少 10% E2E 潜力，则 E33 整体 REJECT，不继续调微小舍入规则。
+
+E33-R3 compensated-PV 成功越过 production operator 门禁。完整 GPU suite 中一般
+case relative RMSE/cosine 从 R1 的 `0.007579086/0.999971287` 改善为
+`0.001673401/0.999998601`，所有 targeted case 均不高于 `0.001725316`，canary、
+finite、determinism 和 fragment mapping 保持 PASS。production candidate/exact hash
+为 `4dab19426ebe2ef2`/`4c9447152b73ee7b`，paired max-abs
+`3.81469727e-06`、relative RMSE `0.000215744884812`、cosine
+`0.999999976728`；相对 E27 的 0.361013% RMSE 约降低 94%。attention/profile
+total/event median 为 `18.727/18.737/18.746 ms`，相对 exact wave32 0.415342 s
+约 **22.2x**，虽比 E27 慢约 24%，仍明显保留 H3 端到端 10% 以上的理论潜力。
+
+E33-R3 静态资源为 216 VGPR、36 SGPR、0 LDS、0 private/scratch；ISA 中 E33 symbol
+有 24 条 BF16 WMMA（8 QK + 8 high-PV + 8 residual-PV），Makefile 已把 `>=24` 固定
+为门禁。GPU unit 的 E33 通用阈值收紧到 RMSE `<0.003`、cosine `>0.999995`，
+targeted case 同样收紧；registry 记录 compensated probability 语义与 gfx1201 已通过
+证据。下一步运行 dirty campaign 的 exact baseline、短轮和三次 confirmation；只有
+campaign 通过后才固定提交，再以 clean source 重跑并生成不可变 result。
+
+campaign 编排继续加固：计时后、同进程同输入的 portable-exact 配对已从 E33 扩展到
+E27，因此下一轮可直接复测历史 E27 质量边界，而不是只依赖旧报告；reference 仍在
+candidate 输出与计时完成后运行，不进入 candidate wall/event/profile。`sagectl` 和
+registry validator 对 paired metric、non-finite 计数和 objective timing 现要求类型
+正确、有限且范围合法，NaN、Infinity、Python `bool` 伪零和非正耗时均不能伪装成
+通过。初次 ROCm-SMI idle preflight 后，benchmark build 完成、
+runner 启动前再执行第二次 idle preflight，runner 随后仍在 allocation/kernel 前核对
+`SAGEATTENTION_EXPECTED_GPU_BDF`。乱序 KFD node/card 映射、忙卡拒绝和结果字段由 9 项
+CLI unit tests 覆盖。
+
+上述最新源码再次通过无 warning 的 library/tests/benchmarks 构建、1 platform/3
+kernels/2 workloads/2 campaigns/1 historical result registry validation、9 项 CLI
+tests、generic/H3 host contract、E33 symbol 24 条 BF16 WMMA ISA 与
+`git diff --check`。H3 也以 `make -B` 和外部当前 Sage 源码强制重编译既有 bridge、
+benchmark 与 `vdn-sage-test`，22 项 mode checks 通过，H3 工作树保持干净、gitlink
+未变化；这只证明 additive source compatibility，不替代 E33 模型级验证。
+
+当前 HIP ordinal 4/BDF `0000:e3:00.0` 映射 ROCm-SMI `card7`，最新只读观测约为
+3% GPU、15.0 GiB/47% VRAM，仍不满足空卡条件。本轮没有共享目标卡或改用其它 GPU；
+收紧阈值后的完整 GPU suite、E27 paired production 复测和 E33 dirty campaign 按顺序
+等待目标卡同时通过 H3 外层守护和 Sage 双 idle preflight。
+
+目标卡释放后，收紧阈值的完整 GPU suite 已由 H3 守护复跑通过：gfx1201 accumulator
+stored/raw mismatch 为 0/0；E33 通用 relative RMSE/cosine 为
+`0.001673401/0.999998601`，四组 targeted 最大 RMSE `0.001725316`，manual interval、
+tail、one-key、multi-interval、extreme、finite、determinism 和双 canary 全绿。
+
+同一 S=5338/H=56/D=128 输入的 E27 paired 复测修正了跨 workload 的历史比较：E27
+candidate/exact hash 为 `d8fccefb0ea98938`/`4c9447152b73ee7b`，relative RMSE/cosine
+为 `0.00733598966153/0.999973093415`，attention/profile/event 为
+`13.829/14.696/14.896 ms`。旧 `0.00361013` 是 S=5837 历史输入，不是当前 S=5338
+E27 数值；campaign 仍保留更严格的 `<=0.00361012/>=0.999993587` 预冻结边界。
+E33-R3 当前 RMSE `0.0002157449` 相对同输入 E27 实际改善约 97.1%。下一步已进入 dirty
+exact-baseline/E33 short 与三轮交错 confirmation；dirty 报告只作为 research evidence。
+
+首次 dirty campaign 未形成最终报告：short baseline/E33 与 confirmation round 1 已
+完成，第二轮 exact baseline 后的 E33 launch preflight 观测 GPU4 瞬时 42% load，按
+规则安全中止。已完成的两次 E33 event 为 `19.159/19.593 ms`，candidate/reference
+hash、RMSE 和 cosine 完全固定；没有共享目标卡。更重要的是，该运行揭示 portable
+exact event 为 `3.865--3.882 s`，远慢于 H3 生产 wave32 约 0.415 s。portable kernel
+每 key 做 256-thread block barriers，适合数值 oracle，不适合作为性能分母；原 campaign
+即使跑完也会产生失真的约 200x，因此作废其性能设计。
+
+campaign 已改用新增的 `wave32_exact_reference`：该路径只在 benchmark registry 中，
+不会进入 public dispatcher/auto；portable exact 继续在候选计时后作为逐位 oracle。
+S=35 已证明 wave32 与 portable hash 相同、paired RMSE=0/cosine=1。production 的三个
+编排迭代也全部逐位一致，但前两种失败性能作为证据保留：每 wave 的全 lane 线性 task
+扫描为 `681.4 ms`，每 task 四个 8-wave block 为 `760.2 ms`；改为 lane0 有序二分并
+广播 task index 后为 `651.4 ms`。同卡 H3 原生 wave32 交叉复测为 `411.328 ms`，确认
+机器没有整体降频，差异来自 H3 默认 `distributed_softmax=true`：归约 score 只广播
+一次，各 lane 独立维护一致的 online state，不在每个 key 广播 old/new 两个系数。
+最终 wave32 baseline 已切为 distributed state，host 构建、4-kernel registry、9 项 CLI
+tests、contract 和 diff check 通过；GPU4 随后出现 3%/599 MiB 占用，H3 守护在启动前
+拒绝，最终变体仍等待 S=35/production 复验。
+
+最终变体静态资源为 37 VGPR、22 SGPR、0 LDS/scratch，device ISA 无 block barrier；
+等待期间又将 canonical JSON 写入收紧为拒绝 NaN/Infinity，registry result timing 要求
+有限非负实数，non-finite 计数与 bool 字段严格验型，campaign objective 继续要求有限
+正数。Python 语法、4-kernel registry、9 项 CLI tests 和 diff check 通过。H3 用
+`make -B` 强制链接当前外部 Sage 源码后，bridge/runtime/benchmark 构建和 22 项 mode
+checks 仍无 warning/error，H3 gitlink/工作树未变化。目标 card7 随后升至约
+13.2 GiB/41% VRAM，故未共享运行最终 GPU 复验。
+
+截至当前可报告的是算子而非完整视频性能：E33 production event 稳定在
+`18.746--19.593 ms`，H3 原生 exact wave32 同卡为 `411.328 ms`，约
+`21.0--22.0x`；E27 为 `14.896 ms`，但其 paired RMSE `0.00733599` 是 E33
+`0.000215745` 的约 34 倍，并已有 audio 下游失败。E33 尚未提交或进入 H3 50 层/
+8-NFE，不能把算子倍数等同于视频端到端收益。
+
+恢复执行后的完整 GPU suite 在 GPU4/BDF `0000:e3:00.0` 再次通过；首次 dirty
+campaign 完成 short 与 confirmation R1 后，下一轮在 6% utilization 处被 5% 内层
+门禁停止。第二次 campaign 也在相邻 trial 之间停止：外层 telemetry 证明刚结束的本
+campaign kernel 仍使 ROCm-SMI 滑动采样显示 37%，约一秒后已回到 3%/57 MiB。这不是
+放宽空卡条件的理由，而是编排必须区分“持续忙卡”和“上一 trial 的短暂采样尾巴”。
+
+因此增加有界 idle re-poll：每个 benchmark 的初始与 launch preflight 最多等待 5 次、
+每次 1 秒，期间必须保持相同 HIP ordinal→PCI BDF 映射；架构变化、identity 变化、指标
+缺失或超过有界窗口仍 fail closed。result session 同时记录两次 poll 数和 delay。该改动
+只解决 campaign 自身 trial 间冷却，不删除 H3 外层空卡/BDF 守护，也不提高 5%/1%
+阈值。新增 unit test 覆盖 busy→idle 与持续 busy 两种路径；下一步先复跑静态门禁，再
+第三次启动 dirty campaign。
+
+第三次 dirty campaign 完整通过。short exact/E33 event median 为
+`429.235870/18.976051 ms`（22.620x）；三轮 confirmation 为
+`431.044403/19.015360`、`431.814697/19.267282`、
+`433.187317/19.366867 ms`，paired speedup median/geomean 为
+`22.4118x/22.4821x`。每轮都解析到 HIP ordinal 4、ROCm-SMI card7、BDF
+`0000:e3:00.0`；最后一轮 E33 initial poll 实际使用了两次，验证 bounded re-poll
+解决了自采样尾巴，其余均为一次。
+
+E33 三轮 candidate hash 固定为 `4dab19426ebe2ef2`，portable exact hash 固定为
+`4c9447152b73ee7b`；paired max-abs/RMSE/cosine 固定为
+`3.81469727e-06/0.000215744884812/0.999999976728`，finite/canary/determinism
+全部通过。dirty 报告位于 ignored `build/sagectl/campaigns/`，只能作为形成源码提交前
+的 research evidence。下一步更新 public README、全量 clean rebuild 后提交源码，
+再从该 clean commit 重跑相同 campaign 并把单独的 immutable result 纳入 registry。

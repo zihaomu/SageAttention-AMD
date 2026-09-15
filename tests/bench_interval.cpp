@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -27,7 +28,9 @@ constexpr unsigned char kGuardValue = 0xa5;
 enum class benchmark_kernel {
     automatic_select,
     e27_gfx12_d128,
+    e33_bf16_qk_gfx12_d128,
     portable_exact_reference,
+    wave32_exact_reference,
 };
 
 bool hip_ok(hipError_t status, const char *operation) {
@@ -53,6 +56,15 @@ bool checked_mul(std::size_t a, std::size_t b, std::size_t *result) {
         return false;
     *result = a * b;
     return true;
+}
+
+std::string normalize_bdf(const char *text) {
+    std::string normalized = text ? text : "";
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                   [](unsigned char character) {
+                       return static_cast<char>(std::tolower(character));
+                   });
+    return normalized;
 }
 
 bool load_plan(const char *path, std::vector<sageattention::q_task> *tasks) {
@@ -129,8 +141,12 @@ benchmark_kernel parse_kernel(const char *name, bool *valid) {
         return benchmark_kernel::automatic_select;
     if (std::string(name) == "e27_gfx12_d128")
         return benchmark_kernel::e27_gfx12_d128;
+    if (std::string(name) == "e33_bf16_qk_gfx12_d128")
+        return benchmark_kernel::e33_bf16_qk_gfx12_d128;
     if (std::string(name) == "portable_exact_reference")
         return benchmark_kernel::portable_exact_reference;
+    if (std::string(name) == "wave32_exact_reference")
+        return benchmark_kernel::wave32_exact_reference;
     *valid = false;
     return benchmark_kernel::automatic_select;
 }
@@ -141,8 +157,12 @@ const char *kernel_name(benchmark_kernel kernel) {
             return "automatic_select";
         case benchmark_kernel::e27_gfx12_d128:
             return "e27_gfx12_d128";
+        case benchmark_kernel::e33_bf16_qk_gfx12_d128:
+            return "e33_bf16_qk_gfx12_d128";
         case benchmark_kernel::portable_exact_reference:
             return "portable_exact_reference";
+        case benchmark_kernel::wave32_exact_reference:
+            return "wave32_exact_reference";
     }
     return "invalid";
 }
@@ -152,6 +172,48 @@ struct cpu_comparison {
     float max_absolute;
     double relative_rmse;
 };
+
+struct paired_comparison {
+    const char *status;
+    float max_absolute;
+    double relative_rmse;
+    double cosine;
+    std::size_t non_finite;
+    std::uint64_t reference_hash;
+};
+
+paired_comparison compare_with_bf16_reference(
+    const std::vector<hip_bfloat16> &reference,
+    const std::vector<hip_bfloat16> &candidate) {
+    if (reference.size() != candidate.size())
+        return {"fail", INFINITY, INFINITY, 0.0, 1, 0};
+    double error_squared = 0.0;
+    double reference_squared = 0.0;
+    double candidate_squared = 0.0;
+    double dot = 0.0;
+    float max_absolute = 0.0f;
+    std::size_t non_finite = 0;
+    for (std::size_t index = 0; index < reference.size(); ++index) {
+        const double expected = static_cast<float>(reference[index]);
+        const double observed = static_cast<float>(candidate[index]);
+        if (!std::isfinite(expected) || !std::isfinite(observed))
+            ++non_finite;
+        const double error = observed - expected;
+        error_squared += error * error;
+        reference_squared += expected * expected;
+        candidate_squared += observed * observed;
+        dot += expected * observed;
+        max_absolute = std::max(
+            max_absolute, static_cast<float>(std::fabs(error)));
+    }
+    const double relative_rmse = std::sqrt(
+        error_squared / std::max(reference_squared, 1.0e-30));
+    const double cosine =
+        dot / std::sqrt(std::max(reference_squared * candidate_squared,
+                                 1.0e-30));
+    return {non_finite ? "fail" : "pass", max_absolute, relative_rmse,
+            cosine, non_finite, hash_bf16(reference)};
+}
 
 cpu_comparison compare_with_cpu_reference(
     std::uint32_t sequence, std::uint32_t heads,
@@ -273,26 +335,53 @@ int main(int argc, char **argv) {
         return 2;
     }
 
+    std::array<char, 64> pci_bus = {};
+    if (!hip_ok(hipDeviceGetPCIBusId(pci_bus.data(), pci_bus.size(), 0),
+                "inspect visible device BDF")) {
+        return EXIT_FAILURE;
+    }
+    const char *expected_pci_bus =
+        std::getenv("SAGEATTENTION_EXPECTED_GPU_BDF");
+    if (expected_pci_bus &&
+        normalize_bdf(expected_pci_bus) != normalize_bdf(pci_bus.data())) {
+        std::fprintf(stderr,
+                     "visible device BDF %s does not match preflighted BDF %s; "
+                     "refusing to launch\n",
+                     pci_bus.data(), expected_pci_bus);
+        return EXIT_FAILURE;
+    }
+
     std::vector<sageattention::q_task> tasks;
     if (!load_plan(argv[1], &tasks)) return 2;
     const sageattention::descriptor operation = {
         {1, sequence, sequence, heads, heads, head_dimension,
          sageattention::layout::nhd},
         {sageattention::data_type::bf16, sageattention::data_type::bf16,
-         sageattention::qk_mode::symmetric_i8,
+         selected_kernel == benchmark_kernel::e33_bf16_qk_gfx12_d128
+             ? sageattention::qk_mode::bf16
+             : sageattention::qk_mode::symmetric_i8,
          sageattention::pv_mode::bf16,
          selected_kernel == benchmark_kernel::automatic_select
              ? sageattention::kernel_id::automatic_select
-             : sageattention::kernel_id::e27_gfx12_d128},
+             : selected_kernel ==
+                       benchmark_kernel::e33_bf16_qk_gfx12_d128
+                   ? sageattention::kernel_id::e33_bf16_qk_gfx12_d128
+                   : sageattention::kernel_id::e27_gfx12_d128},
         tasks.size()};
     const sageattention::interval_plan plan = {tasks.data(), tasks.size()};
     const bool portable =
         selected_kernel == benchmark_kernel::portable_exact_reference;
+    const bool wave32_exact =
+        selected_kernel == benchmark_kernel::wave32_exact_reference;
+    const bool reference_kernel = portable || wave32_exact;
     const hipError_t support =
         portable
             ? sageattention::reference::query_portable_exact_support(
                   sequence, heads, head_dimension)
-            : sageattention::query_support(operation);
+            : wave32_exact
+                  ? sageattention::reference::query_wave32_exact_support(
+                        sequence, heads, head_dimension)
+                  : sageattention::query_support(operation);
     if (!hip_ok(sageattention::validate_interval_plan(operation, plan),
                 "validate interval plan") ||
         !hip_ok(support, "query support")) {
@@ -307,15 +396,15 @@ int main(int argc, char **argv) {
     }
     const std::size_t tensor_bytes = elements * sizeof(hip_bfloat16);
     const std::size_t workspace_bytes =
-        portable ? tasks.size() * sizeof(tasks[0])
-                 : sageattention::workspace_size(operation);
+        reference_kernel ? tasks.size() * sizeof(tasks[0])
+                         : sageattention::workspace_size(operation);
     if (!workspace_bytes) {
         std::fputs("unsupported workspace descriptor\n", stderr);
         return EXIT_FAILURE;
     }
 
     std::vector<hip_bfloat16> query(elements), key(elements), value(elements),
-        output(elements), warmup_output(elements);
+        output(elements), warmup_output(elements), reference_output(elements);
     for (std::size_t index = 0; index < elements; ++index) {
         const int qv = static_cast<int>(index % 251) - 125;
         const int kv = static_cast<int>((index * 17) % 239) - 119;
@@ -330,6 +419,7 @@ int main(int argc, char **argv) {
     void *device_value = nullptr;
     void *device_output_allocation = nullptr;
     void *workspace_allocation = nullptr;
+    void *reference_tasks = nullptr;
     void *device_output = nullptr;
     void *workspace = nullptr;
     hipStream_t stream = nullptr;
@@ -347,6 +437,14 @@ int main(int argc, char **argv) {
               hip_ok(hipStreamCreate(&stream), "hipStreamCreate") &&
               hip_ok(hipEventCreate(&start), "hipEventCreate(start)") &&
               hip_ok(hipEventCreate(&stop), "hipEventCreate(stop)");
+    const bool paired_portable_reference =
+        selected_kernel == benchmark_kernel::e27_gfx12_d128 ||
+        selected_kernel == benchmark_kernel::e33_bf16_qk_gfx12_d128 ||
+        wave32_exact;
+    const std::size_t task_bytes = tasks.size() * sizeof(tasks[0]);
+    if (ok && paired_portable_reference)
+        ok = hip_ok(hipMalloc(&reference_tasks, task_bytes),
+                    "hipMalloc(reference tasks)");
     if (ok) {
         device_output =
             static_cast<unsigned char *>(device_output_allocation) + kGuardBytes;
@@ -368,7 +466,13 @@ int main(int argc, char **argv) {
                     "copy key") &&
              hip_ok(hipMemcpyAsync(device_value, value.data(), tensor_bytes,
                                    hipMemcpyHostToDevice, stream),
-                    "copy value") &&
+                    "copy value");
+        if (ok && paired_portable_reference)
+            ok = hip_ok(hipMemcpyAsync(reference_tasks, tasks.data(),
+                                       task_bytes, hipMemcpyHostToDevice,
+                                       stream),
+                        "copy reference tasks");
+        ok = ok &&
              hip_ok(hipStreamSynchronize(stream), "input sync");
     }
 
@@ -377,19 +481,25 @@ int main(int argc, char **argv) {
         1.0f / std::sqrt(static_cast<float>(head_dimension)), workspace,
         workspace_bytes, stream};
     const auto launch_selected = [&]() {
-        return portable
-                   ? sageattention::reference::launch_portable_exact(
-                         device_query, device_key, device_value, device_output,
-                         static_cast<const sageattention::q_task *>(workspace),
-                         tasks.size(), sequence, heads, head_dimension,
-                         parameters.scale, stream)
-                   : sageattention::launch_prepared(parameters);
+        if (portable)
+            return sageattention::reference::launch_portable_exact(
+                device_query, device_key, device_value, device_output,
+                static_cast<const sageattention::q_task *>(workspace),
+                tasks.size(), sequence, heads, head_dimension,
+                parameters.scale, stream);
+        if (wave32_exact)
+            return sageattention::reference::launch_wave32_exact(
+                device_query, device_key, device_value, device_output,
+                static_cast<const sageattention::q_task *>(workspace),
+                tasks.size(), sequence, heads, head_dimension,
+                parameters.scale, stream);
+        return sageattention::launch_prepared(parameters);
     };
     double metadata_ms = 0.0;
     if (ok) {
         const auto metadata_start = std::chrono::steady_clock::now();
         const hipError_t prepare_error =
-            portable
+            reference_kernel
                 ? hipMemcpyAsync(workspace, tasks.data(), workspace_bytes,
                                  hipMemcpyHostToDevice, stream)
                 : sageattention::prepare_workspace(
@@ -414,7 +524,7 @@ int main(int argc, char **argv) {
     sageattention::profile profile = {};
     for (std::uint32_t profile_run = 0;
          profile_run < kProfileIterations && ok; ++profile_run) {
-        if (portable) {
+        if (reference_kernel) {
             ok = hip_ok(hipEventRecord(start, stream), "profile start") &&
                  hip_ok(launch_selected(), "profiled launch") &&
                  hip_ok(hipEventRecord(stop, stream), "profile stop") &&
@@ -450,6 +560,27 @@ int main(int argc, char **argv) {
                               hipMemcpyDeviceToHost),
                     "copy output");
 
+    paired_comparison paired = {
+        portable ? "self" : "not-run", 0.0f, 0.0,
+        portable ? 1.0 : 0.0, 0,
+        portable ? hash_bf16(output) : 0};
+    if (ok && paired_portable_reference) {
+        ok = hip_ok(sageattention::reference::launch_portable_exact(
+                        device_query, device_key, device_value, device_output,
+                        static_cast<const sageattention::q_task *>(
+                            reference_tasks),
+                        tasks.size(), sequence, heads, head_dimension,
+                        parameters.scale, stream),
+                    "paired portable reference launch") &&
+             hip_ok(hipMemcpyAsync(reference_output.data(), device_output,
+                                   tensor_bytes, hipMemcpyDeviceToHost,
+                                   stream),
+                    "copy paired portable reference") &&
+             hip_ok(hipStreamSynchronize(stream),
+                    "paired portable reference sync");
+        if (ok) paired = compare_with_bf16_reference(reference_output, output);
+    }
+
     if (ok) {
         hipDeviceProp_t properties = {};
         ok = hip_ok(hipGetDeviceProperties(&properties, 0),
@@ -475,6 +606,7 @@ int main(int argc, char **argv) {
         std::printf(
             "{\"schema_version\":1,\"runner\":\"generic-interval-v1\","
             "\"kernel\":\"%s\",\"architecture\":\"%s\","
+            "\"pci_bus\":\"%s\","
             "\"shape\":{\"sequence\":%u,"
             "\"heads\":%u,\"head_dimension\":%u},\"task_count\":%zu,"
             "\"workspace_bytes\":%zu,\"warmup_iterations\":%u,"
@@ -486,8 +618,15 @@ int main(int argc, char **argv) {
             "\"correctness\":{\"non_finite\":%zu,\"deterministic\":%s,"
             "\"guard_canaries\":%s,\"output_hash\":\"%016llx\","
             "\"cpu_reference\":\"%s\","
-            "\"cpu_max_abs\":%.9g,\"cpu_relative_rmse\":%.9g}}\n",
-            kernel_name(selected_kernel), properties.gcnArchName, sequence,
+            "\"cpu_max_abs\":%.9g,\"cpu_relative_rmse\":%.9g,"
+            "\"paired_reference\":\"%s\","
+            "\"paired_max_abs\":%.9g,"
+            "\"paired_relative_rmse\":%.12g,"
+            "\"paired_cosine\":%.12g,"
+            "\"paired_non_finite\":%zu,"
+            "\"paired_reference_hash\":\"%016llx\"}}\n",
+            kernel_name(selected_kernel), properties.gcnArchName,
+            pci_bus.data(), sequence,
             heads, head_dimension,
             tasks.size(), workspace_bytes, kWarmupIterations,
             kProfileIterations, iterations, metadata_ms, profile.q_quant_ms,
@@ -496,9 +635,13 @@ int main(int argc, char **argv) {
             non_finite, deterministic ? "true" : "false",
             guard_canaries ? "true" : "false",
             static_cast<unsigned long long>(final_hash), cpu.status,
-            cpu.max_absolute, cpu.relative_rmse);
+            cpu.max_absolute, cpu.relative_rmse, paired.status,
+            paired.max_absolute, paired.relative_rmse, paired.cosine,
+            paired.non_finite,
+            static_cast<unsigned long long>(paired.reference_hash));
         ok = non_finite == 0 && deterministic && guard_canaries &&
-             std::string(cpu.status) != "fail";
+             std::string(cpu.status) != "fail" &&
+             std::string(paired.status) != "fail";
     }
 
     if (stop) ignore_hip_error(hipEventDestroy(stop));
@@ -506,6 +649,7 @@ int main(int argc, char **argv) {
     if (stream) ignore_hip_error(hipStreamDestroy(stream));
     if (workspace_allocation)
         ignore_hip_error(hipFree(workspace_allocation));
+    if (reference_tasks) ignore_hip_error(hipFree(reference_tasks));
     if (device_output_allocation)
         ignore_hip_error(hipFree(device_output_allocation));
     if (device_value) ignore_hip_error(hipFree(device_value));

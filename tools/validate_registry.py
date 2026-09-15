@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import sys
 from pathlib import Path
@@ -187,11 +188,30 @@ def validate_results(
         require(metrics, path, {"profile_total", "event_median", "event_min", "event_max"})
         require(correctness, path, {"contract_test", "gpu_test", "isa_test", "non_finite", "deterministic"})
         for key, value in metrics.items():
-            if not isinstance(value, (int, float)) or value < 0:
-                error(path, f"metrics_ms.{key} must be non-negative")
-        if all(isinstance(metrics.get(k), (int, float)) for k in ("event_min", "event_median", "event_max")):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0
+            ):
+                error(path, f"metrics_ms.{key} must be a finite non-negative number")
+        if all(
+            not isinstance(metrics.get(key), bool)
+            and isinstance(metrics.get(key), (int, float))
+            and math.isfinite(metrics[key])
+            for key in ("event_min", "event_median", "event_max")
+        ):
             if not metrics["event_min"] <= metrics["event_median"] <= metrics["event_max"]:
                 error(path, "event_min <= event_median <= event_max is required")
+        non_finite = correctness.get("non_finite")
+        if (
+            isinstance(non_finite, bool)
+            or not isinstance(non_finite, int)
+            or non_finite < 0
+        ):
+            error(path, "correctness.non_finite must be a non-negative integer")
+        if not isinstance(correctness.get("deterministic"), bool):
+            error(path, "correctness.deterministic must be boolean")
 
 
 def validate_campaigns(
@@ -287,22 +307,57 @@ def validate_campaigns(
             },
         )
         for key in (
+            "require_cpu_reference",
+            "require_guard_canaries",
+            "require_determinism",
+        ):
+            if not isinstance(gates.get(key), bool):
+                error(path, f"gates.{key} must be boolean")
+        for key in (
             "short_iterations",
             "confirmation_iterations",
             "confirmation_runs",
             "top_k_for_confirmation",
         ):
-            if not isinstance(gates.get(key), int) or gates.get(key, 0) <= 0:
+            if (
+                isinstance(gates.get(key), bool)
+                or not isinstance(gates.get(key), int)
+                or gates.get(key, 0) <= 0
+            ):
                 error(path, f"gates.{key} must be a positive integer")
         if isinstance(candidate_ids, list) and isinstance(
             gates.get("top_k_for_confirmation"), int
         ) and gates["top_k_for_confirmation"] > len(candidate_ids):
             error(path, "top_k_for_confirmation exceeds candidate count")
+        for key in ("max_paired_relative_rmse", "min_paired_cosine"):
+            if key in gates and (
+                isinstance(gates[key], bool)
+                or not isinstance(gates[key], (int, float))
+                or not math.isfinite(gates[key])
+                or gates[key] < 0
+            ):
+                error(path, f"gates.{key} must be a non-negative number")
+        min_paired_cosine = gates.get("min_paired_cosine", 0)
+        if (
+            not isinstance(min_paired_cosine, bool)
+            and isinstance(min_paired_cosine, (int, float))
+            and math.isfinite(min_paired_cosine)
+            and min_paired_cosine > 1
+        ):
+            error(path, "gates.min_paired_cosine must not exceed 1")
         require(acceptance, path, {"minimum_speedup", "stopping_rule"})
-        if not isinstance(acceptance.get("minimum_speedup"), (int, float)) or acceptance.get(
-            "minimum_speedup", 0
-        ) <= 0:
+        minimum_speedup = acceptance.get("minimum_speedup")
+        if (
+            isinstance(minimum_speedup, bool)
+            or not isinstance(minimum_speedup, (int, float))
+            or not math.isfinite(minimum_speedup)
+            or minimum_speedup <= 0
+        ):
             error(path, "acceptance.minimum_speedup must be positive")
+        if not isinstance(acceptance.get("stopping_rule"), str) or not acceptance[
+            "stopping_rule"
+        ].strip():
+            error(path, "acceptance.stopping_rule must be a non-empty string")
 
         if (
             platform_id not in platforms

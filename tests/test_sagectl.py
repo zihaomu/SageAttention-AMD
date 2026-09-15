@@ -5,8 +5,11 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import math
+import uuid
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -21,15 +24,35 @@ LOADER.exec_module(SAGECTL)
 class SagectlTests(unittest.TestCase):
     def test_parse_rocm_smi(self) -> None:
         devices = SAGECTL.parse_rocm_smi(
-            "device,GPU use (%),GPU Memory Allocated (VRAM%),Card Series,GFX Version\r\n"
-            "card0,2,0,AMD Example GPU,gfx1234\n"
-            "card3,70,51,AMD Busy GPU,gfx9999\n"
+            "device,GPU use (%),GPU Memory Allocated (VRAM%),PCI Bus,Card Series,Node ID,GFX Version\r\n"
+            "card0,2,0,0000:83:00.0,AMD Example GPU,14,gfx1234\n"
+            "card3,70,51,0000:63:00.0,AMD Busy GPU,8,gfx9999\n"
         )
         self.assertEqual(devices[0]["index"], 0)
         self.assertEqual(devices[0]["gpu_use_percent"], 2)
         self.assertEqual(devices[0]["memory_use_percent"], 0)
         self.assertEqual(devices[0]["architecture"], "gfx1234")
         self.assertEqual(devices[1]["index"], 3)
+        self.assertEqual(devices[0]["node_id"], 14)
+        self.assertEqual(devices[1]["pci_bus"], "0000:63:00.0")
+        self.assertEqual(
+            SAGECTL.select_smi_device_for_hip_ordinal(devices, 0)["index"], 3
+        )
+        self.assertEqual(
+            SAGECTL.select_smi_device_for_hip_ordinal(devices, 1)["index"], 0
+        )
+        self.assertEqual(
+            SAGECTL.require_benchmark_device_idle(
+                devices, 0, "gfx9999", 80, 60
+            )["pci_bus"],
+            "0000:63:00.0",
+        )
+        with self.assertRaises(SAGECTL.SagectlError):
+            SAGECTL.require_benchmark_device_idle(
+                devices, 0, "gfx9999", 10, 60
+            )
+        with self.assertRaises(SAGECTL.SagectlError):
+            SAGECTL.select_smi_device_for_hip_ordinal(devices, 2)
 
     def test_version_and_id_parsing(self) -> None:
         hip, compiler = SAGECTL.parse_hipcc_version(
@@ -39,6 +62,34 @@ class SagectlTests(unittest.TestCase):
         self.assertEqual(compiler, "AMD clang 22.0.0git")
         self.assertEqual(SAGECTL.gpu_slug("AMD Radeon AI PRO R9700"), "r9700")
         self.assertEqual(SAGECTL.gpu_slug("AMD Instinct MI300X"), "mi300x")
+
+    def test_idle_wait_accepts_sampling_tail_but_stays_bounded(self) -> None:
+        busy = SAGECTL.parse_rocm_smi(
+            "device,GPU use (%),GPU Memory Allocated (VRAM%),PCI Bus,Card Series,Node ID,GFX Version\n"
+            "card7,37,0,0000:e3:00.0,AMD Example GPU,12,gfx1201\n"
+        )
+        idle = SAGECTL.parse_rocm_smi(
+            "device,GPU use (%),GPU Memory Allocated (VRAM%),PCI Bus,Card Series,Node ID,GFX Version\n"
+            "card7,2,0,0000:e3:00.0,AMD Example GPU,12,gfx1201\n"
+        )
+        with mock.patch.object(
+            SAGECTL, "inspect_rocm_smi_devices", side_effect=[busy, idle]
+        ), mock.patch.object(SAGECTL.time, "sleep") as sleep:
+            selected, polls = SAGECTL.wait_for_benchmark_device_idle(
+                "rocm-smi", "test", 0, "gfx1201", 5, 1, 2, 0.25
+            )
+        self.assertEqual(selected["pci_bus"], "0000:e3:00.0")
+        self.assertEqual(polls, 2)
+        sleep.assert_called_once_with(0.25)
+
+        with mock.patch.object(
+            SAGECTL, "inspect_rocm_smi_devices", return_value=busy
+        ), mock.patch.object(SAGECTL.time, "sleep") as sleep:
+            with self.assertRaises(SAGECTL.SagectlError):
+                SAGECTL.wait_for_benchmark_device_idle(
+                    "rocm-smi", "test", 0, "gfx1201", 5, 1, 1, 0.25
+                )
+        self.assertEqual(sleep.call_count, 1)
 
     def test_platform_record_excludes_transient_identity(self) -> None:
         record = SAGECTL.make_platform_record(
@@ -108,6 +159,8 @@ class SagectlTests(unittest.TestCase):
             "require_cpu_reference": True,
             "require_guard_canaries": True,
             "require_determinism": True,
+            "max_paired_relative_rmse": 0.00361012,
+            "min_paired_cosine": 0.999993587,
         }
         passing = {
             "correctness": {
@@ -115,11 +168,47 @@ class SagectlTests(unittest.TestCase):
                 "deterministic": True,
                 "guard_canaries": True,
                 "cpu_reference": "pass",
+                "paired_reference": "pass",
+                "paired_relative_rmse": 0.001,
+                "paired_cosine": 0.999999,
+                "paired_non_finite": 0,
             }
         }
         self.assertTrue(SAGECTL.trial_passes_gates(passing, gates))
         passing["correctness"]["guard_canaries"] = False
         self.assertFalse(SAGECTL.trial_passes_gates(passing, gates))
+        passing["correctness"]["guard_canaries"] = True
+        passing["correctness"]["paired_relative_rmse"] = 0.004
+        self.assertFalse(SAGECTL.trial_passes_gates(passing, gates))
+        passing["correctness"]["paired_relative_rmse"] = 0.001
+        passing["correctness"]["paired_cosine"] = 0.99
+        self.assertFalse(SAGECTL.trial_passes_gates(passing, gates))
+        passing["correctness"]["paired_cosine"] = math.nan
+        self.assertFalse(SAGECTL.trial_passes_gates(passing, gates))
+        passing["correctness"]["paired_cosine"] = 0.999999
+        passing["correctness"]["paired_non_finite"] = False
+        self.assertFalse(SAGECTL.trial_passes_gates(passing, gates))
+        passing["correctness"]["paired_non_finite"] = 0
+        passing["correctness"]["non_finite"] = False
+        self.assertFalse(SAGECTL.trial_passes_gates(passing, gates))
+        passing["correctness"]["non_finite"] = 0
+        self.assertEqual(
+            SAGECTL.objective_metric_ms({"metrics_ms": {"event_median": 1}}, "event_median"),
+            1.0,
+        )
+        for invalid in (True, 0, -1.0, math.nan, math.inf, "1.0"):
+            with self.assertRaises(SAGECTL.SagectlError):
+                SAGECTL.objective_metric_ms(
+                    {"metrics_ms": {"event_median": invalid}}, "event_median"
+                )
+        invalid_json_path = (
+            ROOT / "build" / f"invalid-nonfinite-{uuid.uuid4().hex}.json"
+        )
+        with self.assertRaises(SAGECTL.SagectlError):
+            SAGECTL.write_canonical_json(
+                invalid_json_path, {"metric": math.nan}, force=False
+            )
+        self.assertFalse(invalid_json_path.exists())
 
     def test_architecture_builds_are_isolated(self) -> None:
         self.assertEqual(

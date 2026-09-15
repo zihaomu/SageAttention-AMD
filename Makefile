@@ -77,8 +77,8 @@ gpu-test: $(BUILD_DIR)/test_gpu
 		echo "gpu-test requires an explicit numeric H3_PHYSICAL_GPU" >&2; \
 		exit 2; \
 	fi
-	ROCR_VISIBLE_DEVICES=$(H3_PHYSICAL_GPU) HIP_VISIBLE_DEVICES=0 \
-		$(BUILD_DIR)/test_gpu
+	env -u ROCR_VISIBLE_DEVICES \
+		HIP_VISIBLE_DEVICES=$(H3_PHYSICAL_GPU) $(BUILD_DIR)/test_gpu
 
 test: contract-test gpu-test
 
@@ -87,8 +87,8 @@ bench: $(BUILD_DIR)/bench_h3_vdn
 		echo "bench requires an explicit numeric H3_PHYSICAL_GPU" >&2; \
 		exit 2; \
 	fi
-	ROCR_VISIBLE_DEVICES=$(H3_PHYSICAL_GPU) HIP_VISIBLE_DEVICES=0 \
-		$(BUILD_DIR)/bench_h3_vdn
+	env -u ROCR_VISIBLE_DEVICES \
+		HIP_VISIBLE_DEVICES=$(H3_PHYSICAL_GPU) $(BUILD_DIR)/bench_h3_vdn
 
 $(BUILD_DIR)/h3_vdn_sage_gfx12.s: src/h3_vdn_sage_gfx12.hip | $(BUILD_DIR)
 	$(HIP_CLANG) $(CPPFLAGS) -std=c++17 -O3 $(HIP_FLAGS) --cuda-device-only \
@@ -96,6 +96,12 @@ $(BUILD_DIR)/h3_vdn_sage_gfx12.s: src/h3_vdn_sage_gfx12.hip | $(BUILD_DIR)
 
 isa: $(BUILD_DIR)/h3_vdn_sage_gfx12.s
 	grep -E 'v_wmma_(i32_16x16x16_iu8|f32_16x16x16_bf16)' $<
+	@sed -n '/interval_sage_bf16_qk_gfx12_kernel.*: ;/,/\.Lfunc_end/p' $< | \
+		grep -q 'v_wmma_f32_16x16x16_bf16'
+	@test "$$(sed -n \
+		'/interval_sage_bf16_qk_gfx12_kernel.*: ;/,/\.Lfunc_end/p' $< | \
+		grep -c 'v_wmma_f32_16x16x16_bf16')" -ge 24
+	@echo "E33 BF16 QK + compensated BF16 PV WMMA ISA present"
 
 clean:
 	rm -f $(BUILD_DIR)/*.o $(BUILD_DIR)/*.d $(BUILD_DIR)/*.a $(BUILD_DIR)/*.s \

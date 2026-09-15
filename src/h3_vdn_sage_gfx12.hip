@@ -15,7 +15,6 @@
 
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
-
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -34,14 +33,19 @@ using u32x4 = std::uint32_t __attribute__((ext_vector_type(4)));
 
 [[maybe_unused]] __device__ __forceinline__ std::uint32_t pack_bf16_rne(
     float low, float high) {
-    // Callers only pass finite softmax probabilities in [0, 1]. This permits
-    // branch-free round-to-nearest-even packing without the general BF16
-    // conversion's NaN canonicalization path.
+    // Callers only pass finite softmax probabilities or their small finite
+    // residuals. This permits branch-free round-to-nearest-even packing
+    // without the general BF16 conversion's NaN canonicalization path.
     std::uint32_t low_bits = __builtin_bit_cast(std::uint32_t, low);
     std::uint32_t high_bits = __builtin_bit_cast(std::uint32_t, high);
     low_bits += 0x7fffu + ((low_bits >> 16) & 1u);
     high_bits += 0x7fffu + ((high_bits >> 16) & 1u);
     return (low_bits >> 16) | (high_bits & 0xffff0000u);
+}
+
+[[maybe_unused]] __device__ __forceinline__ float unpack_bf16(
+    std::uint16_t bits) {
+    return __builtin_bit_cast(float, static_cast<std::uint32_t>(bits) << 16);
 }
 
 __device__ __forceinline__ std::int8_t quantize_i8_rne(float value,
@@ -180,6 +184,65 @@ make_probability_fragment(u32x4 words, int lane) {
                         dimension]
                       .data
                 : 0;
+    }
+    return result;
+}
+
+[[maybe_unused]] __device__ __forceinline__ u16x8
+load_bf16_matrix_a_fragment(
+    const hip_bfloat16 *__restrict__ matrix,
+    std::uint32_t row_tile,
+    std::uint32_t head,
+    std::uint32_t sequence,
+    std::uint32_t heads,
+    int depth_tile,
+    int lane) {
+    const std::uint32_t row =
+        row_tile + static_cast<std::uint32_t>(lane & 15);
+    u16x8 result = {0, 0, 0, 0, 0, 0, 0, 0};
+    if (row < sequence) {
+#pragma unroll
+        for (int element = 0; element < 8; ++element) {
+            const std::uint32_t dimension =
+                static_cast<std::uint32_t>(
+                    depth_tile * kTile +
+                    wmma_bf16_k_for_lane_element(lane, element));
+            result[element] =
+                matrix[(static_cast<std::size_t>(row) * heads + head) *
+                           kHeadDim +
+                       dimension]
+                    .data;
+        }
+    }
+    return result;
+}
+
+[[maybe_unused]] __device__ __forceinline__ u16x8
+load_bf16_transposed_matrix_b_fragment(
+    const hip_bfloat16 *__restrict__ matrix,
+    std::uint32_t row_tile,
+    std::uint32_t row_end,
+    std::uint32_t head,
+    std::uint32_t sequence,
+    std::uint32_t heads,
+    int depth_tile,
+    int lane) {
+    u16x8 result = {0, 0, 0, 0, 0, 0, 0, 0};
+    const std::uint32_t row =
+        row_tile + static_cast<std::uint32_t>(lane & 15);
+#pragma unroll
+    for (int element = 0; element < 8; ++element) {
+        if (row < row_end && row < sequence) {
+            const std::uint32_t dimension =
+                static_cast<std::uint32_t>(
+                    depth_tile * kTile +
+                    wmma_bf16_k_for_lane_element(lane, element));
+            result[element] =
+                matrix[(static_cast<std::size_t>(row) * heads + head) *
+                           kHeadDim +
+                       dimension]
+                    .data;
+        }
     }
     return result;
 }
@@ -386,6 +449,200 @@ __global__ __launch_bounds__(64) void interval_sage_i8_bf16_gfx12_kernel(
 #endif
 }
 
+/* E33 keeps the E27 interval/task ABI but removes Q/K quantization. QK is
+ * formed as K @ Q^T so the raw gfx12 accumulator uses the same query-per-lane
+ * / eight-keys-per-element state layout as E27; PV then reuses E27's validated
+ * BF16 fragments. This avoids rocWMMA's gfx1201 register transforms and the
+ * per-key-tile LDS barriers while preserving F32 QK/PV accumulation. */
+__global__ __launch_bounds__(64) void interval_sage_bf16_qk_gfx12_kernel(
+    const hip_bfloat16 *__restrict__ query,
+    const hip_bfloat16 *__restrict__ key,
+    const hip_bfloat16 *__restrict__ value,
+    hip_bfloat16 *__restrict__ output,
+    const sageattention::q_task *__restrict__ tasks,
+    std::uint32_t task_count,
+    std::uint32_t sequence,
+    std::uint32_t heads,
+    float attention_scale) {
+    const std::uint32_t task_index = blockIdx.x;
+    const std::uint32_t head = blockIdx.y;
+    if (task_index >= task_count || head >= heads || threadIdx.x >= 64)
+        return;
+
+#if defined(__gfx12__) || defined(__gfx1200__) || defined(__gfx1201__)
+    const int wave = static_cast<int>(threadIdx.x >> 5);
+    const int lane = static_cast<int>(threadIdx.x & 31);
+    const sageattention::q_task *__restrict__ task = tasks + task_index;
+    const std::uint32_t task_q_begin = task->q_begin;
+    const std::uint32_t task_q_count = task->q_count;
+    const std::uint32_t task_q_end = task_q_begin + task_q_count;
+    const std::uint32_t task_interval_count = task->interval_count;
+    const std::uint32_t query_tile =
+        task_q_begin + static_cast<std::uint32_t>(wave * kTile);
+    const std::uint32_t query_row =
+        query_tile + static_cast<std::uint32_t>(lane & 15);
+    const bool query_valid = query_row < task_q_end && query_row < sequence;
+
+    u16x8 query_fragments[kDepthTiles];
+#pragma unroll
+    for (int depth_tile = 0; depth_tile < kDepthTiles; ++depth_tile) {
+        query_fragments[depth_tile] =
+            load_bf16_transposed_matrix_b_fragment(
+                query, query_tile, task_q_end, head, sequence, heads,
+                depth_tile, lane);
+    }
+
+    f32x8 output_fragments[kDepthTiles];
+#pragma unroll
+    for (int depth_tile = 0; depth_tile < kDepthTiles; ++depth_tile) {
+#pragma unroll
+        for (int element = 0; element < 8; ++element)
+            output_fragments[depth_tile][element] = 0.0f;
+    }
+
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
+    for (std::uint32_t interval_index = 0;
+         interval_index < task_interval_count; ++interval_index) {
+        const sageattention::key_interval interval =
+            task->allowed[interval_index];
+        const std::uint64_t first_tile = interval.begin & ~15u;
+        for (std::uint64_t key_tile_wide = first_tile;
+             key_tile_wide < interval.end; key_tile_wide += kTile) {
+            const std::uint32_t key_tile =
+                static_cast<std::uint32_t>(key_tile_wide);
+            f32x8 score_accumulator = {0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
+            for (int depth_tile = 0; depth_tile < kDepthTiles;
+                 ++depth_tile) {
+                const u16x8 key_fragment = load_bf16_matrix_a_fragment(
+                    key, key_tile, head, sequence, heads, depth_tile,
+                    lane);
+                score_accumulator =
+                    __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(
+                        key_fragment, query_fragments[depth_tile],
+                        score_accumulator);
+            }
+
+            f32x8 scores;
+            float local_max = -INFINITY;
+#pragma unroll
+            for (int element = 0; element < 8; ++element) {
+                const std::uint32_t key_row =
+                    key_tile + static_cast<std::uint32_t>(
+                                   ((lane >> 4) << 3) + element);
+                const bool allowed =
+                    query_valid && key_in_interval(interval, key_row,
+                                                   sequence);
+                scores[element] =
+                    allowed ? score_accumulator[element] * attention_scale
+                            : -INFINITY;
+                local_max = fmaxf(local_max, scores[element]);
+            }
+            const float tile_max =
+                fmaxf(local_max, __shfl_xor(local_max, 16, 32));
+            const float next_max = fmaxf(running_max, tile_max);
+            const float alpha = running_sum == 0.0f
+                                    ? 0.0f
+                                    : __expf(running_max - next_max);
+            running_max = next_max;
+            running_sum *= alpha;
+
+            const int output_row_base = (lane >> 4) << 3;
+#pragma unroll
+            for (int depth_tile = 0; depth_tile < kDepthTiles;
+                 ++depth_tile) {
+#pragma unroll
+                for (int element = 0; element < 8; ++element) {
+                    const float row_alpha =
+                        __shfl(alpha, output_row_base + element, 32);
+                    output_fragments[depth_tile][element] *= row_alpha;
+                }
+            }
+
+            u32x4 probability_words;
+            u32x4 probability_residual_words;
+            float local_sum = 0.0f;
+            const float probability_max = query_valid ? running_max : 0.0f;
+#pragma unroll
+            for (int pair = 0; pair < 4; ++pair) {
+                const int low_element = 2 * pair;
+                const int high_element = low_element + 1;
+                const float low_probability =
+                    __expf(scores[low_element] - probability_max);
+                const float high_probability =
+                    __expf(scores[high_element] - probability_max);
+                local_sum += low_probability + high_probability;
+                const std::uint32_t packed =
+                    pack_bf16_rne(low_probability, high_probability);
+                probability_words[pair] = packed;
+                const float low_rounded = unpack_bf16(
+                    static_cast<std::uint16_t>(packed));
+                const float high_rounded = unpack_bf16(
+                    static_cast<std::uint16_t>(packed >> 16));
+                probability_residual_words[pair] = pack_bf16_rne(
+                    low_probability - low_rounded,
+                    high_probability - high_rounded);
+            }
+            running_sum +=
+                local_sum + __shfl_xor(local_sum, 16, 32);
+            const u16x8 probability_fragment =
+                make_probability_fragment(probability_words, lane);
+            const u16x8 probability_residual_fragment =
+                make_probability_fragment(probability_residual_words, lane);
+
+#pragma unroll
+            for (int depth_tile = 0; depth_tile < kDepthTiles;
+                 ++depth_tile) {
+                const u16x8 value_fragment = load_value_fragment(
+                    value, key_tile, head, sequence, heads, depth_tile,
+                    lane);
+                output_fragments[depth_tile] =
+                    __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(
+                        probability_fragment, value_fragment,
+                        output_fragments[depth_tile]);
+                output_fragments[depth_tile] =
+                    __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(
+                        probability_residual_fragment, value_fragment,
+                        output_fragments[depth_tile]);
+            }
+        }
+    }
+
+    const int output_row_base = (lane >> 4) << 3;
+    const int task_output_row_base = wave * kTile + output_row_base;
+#pragma unroll
+    for (int element = 0; element < 8; ++element) {
+        const float denominator =
+            __shfl(running_sum, output_row_base + element, 32);
+        const float inverse_denominator = 1.0f / denominator;
+        const std::uint32_t row =
+            task_q_begin +
+            static_cast<std::uint32_t>(task_output_row_base + element);
+        if (row >= task_q_end || row >= sequence) continue;
+#pragma unroll
+        for (int depth_tile = 0; depth_tile < kDepthTiles; ++depth_tile) {
+            const std::uint32_t dimension = static_cast<std::uint32_t>(
+                depth_tile * kTile + (lane & 15));
+            output[(static_cast<std::size_t>(row) * heads + head) *
+                       kHeadDim +
+                   dimension] = hip_bfloat16(
+                output_fragments[depth_tile][element] * inverse_denominator);
+        }
+    }
+#else
+    (void)query;
+    (void)key;
+    (void)value;
+    (void)output;
+    (void)tasks;
+    (void)task_count;
+    (void)sequence;
+    (void)heads;
+    (void)attention_scale;
+#endif
+}
+
 
 }  // namespace
 
@@ -455,7 +712,9 @@ static hipError_t launch_prepared_impl(const params &operation_params,
     if (descriptor_error != hipSuccess) return descriptor_error;
     const kernel_registration *registration =
         resolve_kernel_registration(operation_params.operation);
-    if (!registration || registration->id != kernel_id::e27_gfx12_d128)
+    if (!registration ||
+        (registration->id != kernel_id::e27_gfx12_d128 &&
+         registration->id != kernel_id::e33_bf16_qk_gfx12_d128))
         return hipErrorNotSupported;
     workspace_layout layout_result = {};
     if (!make_workspace_layout(operation_params.operation, &layout_result) ||
@@ -472,10 +731,12 @@ static hipError_t launch_prepared_impl(const params &operation_params,
         return hipErrorNotSupported;
     if (layout_result.task_count >
             static_cast<std::size_t>(properties.maxGridSize[0]) ||
-        layout_result.q_groups >
-            static_cast<std::size_t>(properties.maxGridSize[0]) ||
-        layout_result.k_groups >
-            static_cast<std::size_t>(properties.maxGridSize[0]) ||
+        (layout_result.q_groups &&
+         layout_result.q_groups >
+             static_cast<std::size_t>(properties.maxGridSize[0])) ||
+        (layout_result.k_groups &&
+         layout_result.k_groups >
+             static_cast<std::size_t>(properties.maxGridSize[0])) ||
         operation_params.operation.shape.query_heads >
             static_cast<std::uint32_t>(properties.maxGridSize[1])) {
         return hipErrorInvalidConfiguration;
@@ -498,6 +759,34 @@ static hipError_t launch_prepared_impl(const params &operation_params,
         if (marks) {
             error = hipEventRecord(marks[0], operation_params.stream);
             if (error != hipSuccess) return error;
+        }
+        if (registration->id == kernel_id::e33_bf16_qk_gfx12_d128) {
+            if (marks) {
+                error = hipEventRecord(marks[1], operation_params.stream);
+                if (error != hipSuccess) return error;
+                error = hipEventRecord(marks[2], operation_params.stream);
+                if (error != hipSuccess) return error;
+            }
+            const dim3 attention_grid(
+                static_cast<unsigned int>(layout_result.task_count),
+                operation_params.operation.shape.query_heads);
+            hipLaunchKernelGGL(
+                interval_sage_bf16_qk_gfx12_kernel, attention_grid,
+                dim3(64), 0, operation_params.stream,
+                static_cast<const hip_bfloat16 *>(operation_params.query),
+                static_cast<const hip_bfloat16 *>(operation_params.key),
+                static_cast<const hip_bfloat16 *>(operation_params.value),
+                static_cast<hip_bfloat16 *>(operation_params.output),
+                device_tasks,
+                static_cast<std::uint32_t>(layout_result.task_count),
+                operation_params.operation.shape.query_sequence,
+                operation_params.operation.shape.query_heads,
+                operation_params.scale);
+            error = hipGetLastError();
+            if (error != hipSuccess) return error;
+            if (marks)
+                return hipEventRecord(marks[3], operation_params.stream);
+            return hipSuccess;
         }
         const dim3 q_grid(
             static_cast<unsigned int>(layout_result.q_groups),
@@ -583,6 +872,11 @@ hipError_t launch_profiled(const params &operation_params,
         error = hipEventElapsedTime(&timing->attention_ms, marks[2], marks[3]);
     if (error == hipSuccess)
         error = hipEventElapsedTime(&timing->total_ms, marks[0], marks[3]);
+    if (error == hipSuccess &&
+        operation_params.operation.options.qk == qk_mode::bf16) {
+        timing->q_quant_ms = 0.0f;
+        timing->k_quant_ms = 0.0f;
+    }
     for (int index = 0; index < created; ++index) {
         const hipError_t ignored = hipEventDestroy(marks[index]);
         (void)ignored;
