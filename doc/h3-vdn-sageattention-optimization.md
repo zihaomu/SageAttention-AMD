@@ -1531,3 +1531,28 @@ operator event 从 clean 双项候选 19.247 ms 增至 23.209 ms，paired RMSE �
 `0.000215744884812` 增至 `0.000266110605655`，hash 也随之改变。第三个极小 tail
 逐 tile 加入现有 F32 accumulator 会改变累计舍入，却没有带来期望的质量下降，故未
 进入任何 H3 长测、未修改 registry/result，也不继续堆叠更多 residual。
+
+## 2026-09-18：原始 H3 dense E33 接入结果
+
+本轮没有修改 E33 device kernel。假设是 generic ordered-interval API 可用每个 32-row
+Q task 的单个 `[0,S)` interval 表达原始 H3 dense attention，并在 gfx1201 的
+`S=9300,H=56,D=128` production shape 上超过 rocBLAS matrix 至少 10%。新增 workload、
+campaign、boundary/partial-task contract 和 GPU test；production plan 为 291 tasks、
+尾 task 20 rows、workspace 15,360 bytes。
+
+三轮 clean-source standalone event median 为 `68.186874/68.341049/68.866898 ms`，
+output hash 固定为 `c7d8c3a870da26aa`，paired max-abs/relative-RMSE/cosine 为
+`9.53674316e-07/0.00026805282434/0.999999964077`。H3 same-QKV 对当前 rocBLAS 的三轮
+中位 speedup 为 `1.546x`；20-resident-block production NFE 从 `11.799 s` 降到中位
+`9.799 s`，累计 SDPA 从 `5.295 s` 降到 `3.461 s`。官方 50-block/2-NFE DiT oracle
+全部通过。
+
+完整 640x384、124-frame、50-NFE、双 VAE/mux 的三轮 wall 为
+`761/772/774 s`，raw PPM 和 MP4 均逐位确定，中位数相对 matrix `849.46 s` 降低
+`9.12%`；人工视觉无色块、棋盘格或主体崩坏。但与冻结 matrix 成片的逐帧 SSIM/PSNR
+仅 `0.378892/13.944662 dB`，低于 consumer 冻结的
+`0.933314/31.089467 dB` promotion 门槛，主体位置/姿态存在可见漂移。
+
+结论为 `KEEP_EXPERIMENTAL`：original H3 可以显式选择 E33，默认/auto 继续使用
+rocBLAS matrix；VDN 的既有 audio failure 结论也不变。只有新的数值机制能解释并缩小
+50-NFE 累积漂移时才重开 promotion 实验，不能靠放宽已冻结媒体门槛提升默认。

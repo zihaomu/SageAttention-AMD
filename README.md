@@ -22,6 +22,8 @@ The current gfx1201 specializations support:
 - experimental E33 BF16 Q/K WMMA with FP32 accumulation and compensated
   `BF16 high + BF16 residual` PV;
 - sparse attention represented as ordered key intervals per Q super-tile;
+- dense attention represented by one `[0,S)` interval per 32-row Q task,
+  including the original H3 `S=9300,H=56,D=128` production workload;
 - the H3 VDN `window + chunk + bidirectional anchors + global tokens` planner;
 - streaming FP32 online softmax without an `S x S` score or mask buffer;
 - gfx12 BF16 WMMA PV with FP32 accumulation;
@@ -45,7 +47,8 @@ The generic API accepts raw device pointers, a HIP stream, an operation
 descriptor, caller-owned workspace, and an ordered-interval plan. H3 geometry
 is converted into that plan by the compatibility adapter. The E27 and E33 hot
 kernels remain separate specializations and receive the same ordered task
-layout; E33 is generic-API only until H3 downstream quality gates pass.
+layout. Original H3 dense attention consumes E33 through the generic API;
+model-level default policy remains in the H3 consumer repository.
 
 ## Capability and evidence model
 
@@ -64,9 +67,10 @@ mode. A measurement on one tuple is never treated as evidence for another.
 
 Run `make metadata-check` to validate references and compatibility. The current
 validated tuple is R9700/gfx1201 wave32 on ROCm 7.2.3 with experimental E27 and
-E33 ordered-interval `D=128` specializations and the H3 VDN workload. Registry
-presence does not by itself mean a kernel is a stable default; status and
-downstream quality are recorded separately.
+E33 ordered-interval `D=128` specializations, the H3 VDN workload, and original
+H3 dense `S=9300,H=56,D=128`. Registry presence does not by itself mean a
+kernel is a stable default; status and downstream quality are recorded
+separately.
 
 ## Build
 
@@ -208,6 +212,13 @@ fields. Against a separately timed portable-exact output from the same input,
 relative RMSE is 0.000215745 and cosine is 0.999999976728. This is upstream
 operator evidence only; it is not an H3 end-to-end promotion result.
 
+For original H3 dense `S=9300,H=56,D=128`, three clean-source sessions on an
+R9700/gfx1201 card recorded E33 event medians of 68.187, 68.341, and 68.867 ms.
+The output hash was stable in all sessions; paired-reference relative RMSE was
+0.000268053 and cosine was 0.999999964077. The immutable records are under
+[`benchmarks/results/`](benchmarks/results/), keyed by the
+`h3-original-dense-s9300-h56-d128` workload ID.
+
 ## Quality status
 
 E27 is fast and passes operator correctness, real 50-layer propagation,
@@ -225,11 +236,15 @@ The H3 integration therefore keeps exact BF16 wave32 as `auto` and exposes
 E27 only through explicit `H3_VDN_SDPA=sage-i8-bf16` selection. Operator speed
 must not be presented as model-level acceptance.
 
-E33 is an upstream experimental candidate, not an H3 default. It passed clean
-operator evidence and H3 prompt-2 50-layer thresholds, but failed the 8-NFE
-audio latent gate at 10.684% relative RMSE and 0.994280 cosine; video passed.
-The three-prompt media gate was therefore not run. H3's E27 and exact default
-behavior remains unchanged.
+E33 remains experimental, with separate downstream outcomes. On H3 VDN it
+passed clean operator evidence and prompt-2 50-layer thresholds, but failed the
+8-NFE audio latent gate at 10.684% relative RMSE and 0.994280 cosine; video
+passed, so the three-prompt media gate was not run. On original H3 dense BF16,
+it passed the official 50-block/2-NFE oracle and three deterministic complete
+640x384, 124-frame, 50-NFE A/V runs. Median complete wall time improved from
+14:09.46 to 12:52, but frame SSIM/PSNR against the frozen matrix render was
+0.378892/13.944662 dB, below that consumer's immutable promotion threshold.
+Both consumers therefore keep E33 behind explicit selection.
 
 ## Repository layout
 

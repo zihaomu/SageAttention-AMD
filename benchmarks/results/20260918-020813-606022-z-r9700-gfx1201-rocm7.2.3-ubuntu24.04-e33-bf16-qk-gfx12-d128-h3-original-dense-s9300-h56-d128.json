@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "result_id": "20260918-020813-606022-z-r9700-gfx1201-rocm7.2.3-ubuntu24.04-e33-bf16-qk-gfx12-d128-h3-original-dense-s9300-h56-d128",
+  "recorded_at": "2026-09-18T10:08:13+08:00",
+  "evidence_level": "research",
+  "measurement_scope": "operator-including-qk-quantization",
+  "git_commit": "bde9cb96ef67c6083b35684a167ee61a72ab186f",
+  "source_dirty": false,
+  "platform_id": "r9700-gfx1201-rocm7.2.3-ubuntu24.04",
+  "kernel_id": "e33-bf16-qk-gfx12-d128",
+  "workload_id": "h3-original-dense-s9300-h56-d128",
+  "session": {
+    "physical_device_index": 1,
+    "rocm_smi_index": 2,
+    "pci_bus": "0000:43:00.0",
+    "gpu_use_percent_before": 3,
+    "gpu_memory_percent_before": 0,
+    "idle_preflight_polls": 1,
+    "launch_idle_preflight_polls": 1,
+    "idle_retry_delay_seconds": 1.0,
+    "command": "./tools/sagectl benchmark --gpu 1 --platform r9700-gfx1201-rocm7.2.3-ubuntu24.04 --kernel e33-bf16-qk-gfx12-d128 --workload h3-original-dense-s9300-h56-d128 --iterations 10",
+    "warmup_iterations": 3,
+    "measured_iterations": 10,
+    "runner": "generic-interval-v1"
+  },
+  "metrics_ms": {
+    "metadata_cold": 0.047189,
+    "q_quant": 0.0,
+    "k_quant": 0.0,
+    "attention": 68.798203,
+    "profile_total": 68.806717,
+    "event_median": 68.866898,
+    "event_min": 68.793579,
+    "event_max": 88.380829,
+    "wall_per_iteration": 70.846576
+  },
+  "resources": {
+    "tasks": 291,
+    "workspace_bytes": 15360
+  },
+  "correctness": {
+    "contract_test": "not-run-by-benchmark-command",
+    "gpu_test": "benchmark-smoke-pass",
+    "isa_test": "not-run-by-benchmark-command",
+    "non_finite": 0,
+    "deterministic": true,
+    "guard_canaries": true,
+    "output_hash": "c7d8c3a870da26aa",
+    "cpu_reference": "skipped-large-workload",
+    "cpu_max_abs": 0,
+    "cpu_relative_rmse": 0,
+    "paired_reference": "pass",
+    "paired_max_abs": 9.53674316e-07,
+    "paired_relative_rmse": 0.00026805282434,
+    "paired_cosine": 0.999999964077,
+    "paired_non_finite": 0,
+    "paired_reference_hash": "481aec4ea718f7cc"
+  }
+}

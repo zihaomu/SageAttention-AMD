@@ -51,10 +51,14 @@
     "guard_canaries": "pass-gfx1201-2026-09-14",
     "determinism": "pass-gfx1201-2026-09-14",
     "isa": "pass-24-bf16-wmma-instructions-2026-09-15",
+    "original_h3_dense_operator": "pass-3-sessions-s9300-h56-2026-09-18",
+    "original_h3_dit_oracle": "pass-50-block-2nfe-2026-09-18",
+    "original_h3_full_e2e": "stress-pass-3-of-3-quality-metric-fail-2026-09-18",
     "downstream_h3_audio_gate": "fail-prompt2-8nfe-2026-09-15"
   },
   "limitations": [
     "Explicit experimental selection only; never an H3 automatic default.",
+    "Original H3 full E2E is deterministic and faster, but missed the frozen matrix-render SSIM/PSNR promotion threshold.",
     "The ordered-interval plan ABI accepts at most 32 query rows and 5 key intervals per task.",
     "Only gfx1201 wave32, BF16 input/output and D128 are validated.",
     "Compensated probability uses two BF16 PV WMMA operations per output tile."
