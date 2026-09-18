@@ -186,6 +186,17 @@ std::vector<sageattention::q_task> build_generic_tasks(
     return result;
 }
 
+std::vector<sageattention::q_task> build_dense_tasks(
+    std::uint32_t sequence) {
+    std::vector<sageattention::q_task> result;
+    for (std::uint32_t begin = 0; begin < sequence; begin += 32) {
+        const std::uint32_t count =
+            std::min<std::uint32_t>(32, sequence - begin);
+        result.push_back({begin, count, 1, {{0, sequence}}});
+    }
+    return result;
+}
+
 std::vector<float> cpu_attention(
     const h3_vdn_sage_geometry &g,
     const std::vector<hip_bfloat16> &query,
@@ -421,6 +432,77 @@ bool test_bf16_qk_correctness_and_determinism() {
     CHECK(non_finite == 0);
     CHECK(relative_rmse < 0.003);
     CHECK(cosine > 0.999995);
+    return true;
+}
+
+bool test_bf16_qk_dense_boundaries() {
+    const std::uint32_t boundaries[] = {
+        1, 15, 16, 17, 31, 32, 33, 63, 64, 65};
+    for (const std::uint32_t sequence : boundaries) {
+        const std::uint32_t heads = sequence == 65 ? 56u : 1u;
+        const std::vector<sageattention::q_task> tasks =
+            build_dense_tasks(sequence);
+        const sageattention::descriptor operation = {
+            {1, sequence, sequence, heads, heads, 128,
+             sageattention::layout::nhd},
+            {sageattention::data_type::bf16,
+             sageattention::data_type::bf16,
+             sageattention::qk_mode::bf16,
+             sageattention::pv_mode::bf16,
+             sageattention::kernel_id::e33_bf16_qk_gfx12_d128},
+            tasks.size()};
+        const std::size_t elements = static_cast<std::size_t>(sequence) *
+                                     heads * 128;
+        std::vector<hip_bfloat16> query(elements, hip_bfloat16(0.0f));
+        std::vector<hip_bfloat16> key(elements, hip_bfloat16(0.0f));
+        std::vector<hip_bfloat16> value(elements);
+        for (std::uint32_t row = 0; row < sequence; ++row) {
+            for (std::uint32_t head = 0; head < heads; ++head) {
+                for (std::uint32_t dimension = 0; dimension < 128;
+                     ++dimension) {
+                    const int centered = static_cast<int>(
+                        (row * 17 + head * 11 + dimension * 3) % 53) - 26;
+                    const std::size_t index =
+                        (static_cast<std::size_t>(row) * heads + head) * 128 +
+                        dimension;
+                    value[index] = hip_bfloat16(
+                        static_cast<float>(centered) * 0.015f);
+                }
+            }
+        }
+        std::vector<hip_bfloat16> output(elements);
+        CHECK(run_generic_operator(
+            operation, {tasks.data(), tasks.size()}, query, key, value,
+            &output));
+        float max_absolute = 0.0f;
+        for (std::uint32_t head = 0; head < heads; ++head) {
+            for (std::uint32_t dimension = 0; dimension < 128;
+                 ++dimension) {
+                float expected = 0.0f;
+                for (std::uint32_t row = 0; row < sequence; ++row) {
+                    const std::size_t index =
+                        (static_cast<std::size_t>(row) * heads + head) * 128 +
+                        dimension;
+                    expected += static_cast<float>(value[index]);
+                }
+                expected /= static_cast<float>(sequence);
+                for (std::uint32_t row = 0; row < sequence; ++row) {
+                    const std::size_t index =
+                        (static_cast<std::size_t>(row) * heads + head) * 128 +
+                        dimension;
+                    const float observed = static_cast<float>(output[index]);
+                    CHECK(std::isfinite(observed));
+                    max_absolute = std::max(
+                        max_absolute, std::fabs(observed - expected));
+                }
+            }
+        }
+        std::printf("E33 dense boundary S=%u H=%u tasks=%zu max_abs=%.7g "
+                    "hash=%016llx\n",
+                    sequence, heads, tasks.size(), max_absolute,
+                    static_cast<unsigned long long>(hash_bf16(output)));
+        CHECK(max_absolute < 0.005f);
+    }
     return true;
 }
 
@@ -957,6 +1039,7 @@ int main() {
         !test_manual_generic_interval_plan() ||
         !test_correctness_and_determinism() ||
         !test_bf16_qk_correctness_and_determinism() ||
+        !test_bf16_qk_dense_boundaries() ||
         !test_h3_17_frame_misaligned_geometry() ||
         !test_targeted_h3_geometries() ||
         !test_bf16_qk_targeted_geometries() ||

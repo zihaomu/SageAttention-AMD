@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "campaign_id": "gfx1201-h3-original-dense-e33-bf16-qk",
+  "status": "active",
+  "platform_id": "r9700-gfx1201-rocm7.2.3-ubuntu24.04",
+  "workload_ids": [
+    "h3-original-dense-s9300-h56-d128"
+  ],
+  "baseline_kernel_id": "exact-wave32-bf16-gfx1201-d128",
+  "candidate_kernel_ids": [
+    "e33-bf16-qk-gfx12-d128"
+  ],
+  "hypothesis": "The existing compensated E33 BF16-QK kernel can execute original MiniMax-H3 S9300 H56 D128 dense attention without materializing a score matrix, pass the paired numerical gates, and beat the exact wave32 baseline; downstream integration will separately compare it with H3's rocBLAS matrix path.",
+  "objective": {
+    "metric": "event_median",
+    "direction": "minimize",
+    "measurement_scope": "operator-including-qk-quantization"
+  },
+  "search_space": {
+    "kind": "registered-kernel-comparison",
+    "kernel_ids": [
+      "e33-bf16-qk-gfx12-d128"
+    ]
+  },
+  "gates": {
+    "require_cpu_reference": false,
+    "require_guard_canaries": true,
+    "require_determinism": true,
+    "max_paired_relative_rmse": 0.0041262568,
+    "min_paired_cosine": 0.99999,
+    "short_iterations": 3,
+    "confirmation_iterations": 10,
+    "confirmation_runs": 3,
+    "top_k_for_confirmation": 1
+  },
+  "acceptance": {
+    "minimum_speedup": 1.1,
+    "stopping_rule": "Do not integrate or tune device code unless the production dense operator passes correctness, guard-canary, determinism and ISA gates. H3 rocBLAS same-QKV, DiT oracle and full-media gates remain downstream requirements."
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "workload_id": "h3-original-dense-s9300-h56-d128",
+  "description": "Original MiniMax-H3 640x384 124-frame production dense self-attention workload",
+  "measurement_scope": "operator-including-qk-quantization",
+  "shape": {
+    "batch": 1,
+    "sequence": 9300,
+    "heads": 56,
+    "head_dimension": 128,
+    "layout": "NHD",
+    "input_dtype": "bf16",
+    "output_dtype": "bf16"
+  },
+  "mask": {
+    "plan_class": "ordered-interval-v1",
+    "generator": "dense-v1",
+    "q_tile_rows": 32
+  }
+}

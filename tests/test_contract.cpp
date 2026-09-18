@@ -1,6 +1,7 @@
 #include "h3_vdn_sage.hpp"
 #include "sage_attention.hpp"
 
+#include <algorithm>
 #include <cfenv>
 #include <cmath>
 #include <cstdint>
@@ -88,6 +89,16 @@ std::vector<sageattention::q_task> generic_tasks_from_h3(
                 h3_tasks[task_index].allowed[interval_index].begin,
                 h3_tasks[task_index].allowed[interval_index].end};
         }
+    }
+    return result;
+}
+
+std::vector<sageattention::q_task> dense_tasks(std::uint32_t sequence) {
+    std::vector<sageattention::q_task> result;
+    for (std::uint32_t begin = 0; begin < sequence; begin += 32) {
+        const std::uint32_t count =
+            std::min<std::uint32_t>(32, sequence - begin);
+        result.push_back({begin, count, 1, {{0, sequence}}});
     }
     return result;
 }
@@ -285,6 +296,49 @@ bool test_generic_interval_plan() {
     return true;
 }
 
+bool test_h3_original_dense_plan() {
+    const std::uint32_t boundaries[] = {
+        1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 9300};
+    for (const std::uint32_t sequence : boundaries) {
+        const std::vector<sageattention::q_task> tasks =
+            dense_tasks(sequence);
+        const sageattention::descriptor operation = {
+            {1, sequence, sequence, sequence == 9300 ? 56u : 1u,
+             sequence == 9300 ? 56u : 1u, 128,
+             sageattention::layout::nhd},
+            {sageattention::data_type::bf16,
+             sageattention::data_type::bf16,
+             sageattention::qk_mode::bf16,
+             sageattention::pv_mode::bf16,
+             sageattention::kernel_id::e33_bf16_qk_gfx12_d128},
+            tasks.size()};
+        const sageattention::interval_plan plan = {
+            tasks.data(), tasks.size()};
+        CHECK(tasks.size() == (sequence + 31) / 32);
+        CHECK(sageattention::validate_descriptor(operation) == hipSuccess);
+        CHECK(sageattention::validate_interval_plan(operation, plan) ==
+              hipSuccess);
+        CHECK(sageattention::workspace_size(operation) > 0);
+        std::uint32_t next_query = 0;
+        for (const sageattention::q_task &task : tasks) {
+            CHECK(task.q_begin == next_query);
+            CHECK(task.q_count >= 1 && task.q_count <= 32);
+            CHECK(task.interval_count == 1);
+            CHECK(task.allowed[0].begin == 0);
+            CHECK(task.allowed[0].end == sequence);
+            next_query += task.q_count;
+        }
+        CHECK(next_query == sequence);
+        CHECK(tasks.back().q_count == ((sequence - 1) % 32) + 1);
+        if (sequence == 9300) {
+            CHECK(tasks.size() == 291);
+            CHECK(tasks.back().q_count == 20);
+            CHECK(sageattention::workspace_size(operation) == 15360);
+        }
+    }
+    return true;
+}
+
 bool test_validation_and_workspace() {
     const h3_vdn_sage_geometry production = {
         5338, 56, 128, 986, 17, 256, 1, 5, true};
@@ -317,7 +371,8 @@ bool test_validation_and_workspace() {
 
 int main() {
     if (!test_masks_and_tasks() || !test_quantization_contract() ||
-        !test_generic_interval_plan() || !test_validation_and_workspace())
+        !test_generic_interval_plan() || !test_h3_original_dense_plan() ||
+        !test_validation_and_workspace())
         return EXIT_FAILURE;
     std::puts("generic/H3 interval plans, INT8 rounding, validation and "
               "workspace passed");
