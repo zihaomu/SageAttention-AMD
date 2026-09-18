@@ -1556,3 +1556,28 @@ output hash 固定为 `c7d8c3a870da26aa`，paired max-abs/relative-RMSE/cosine �
 结论为 `KEEP_EXPERIMENTAL`：original H3 可以显式选择 E33，默认/auto 继续使用
 rocBLAS matrix；VDN 的既有 audio failure 结论也不变。只有新的数值机制能解释并缩小
 50-NFE 累积漂移时才重开 promotion 实验，不能靠放宽已冻结媒体门槛提升默认。
+
+## 2026-09-18：S9322/H56 E33 有界微优化搜索
+
+在 consumer commit `65a6b35`、SageAttention commit `133b531`、ROCm 7.2.3、
+gfx1201 上冻结 `S=9322,H=56,D=128`、BF16 dense non-causal 负载。独立
+portable reference、11 个 boundary case、guard canary、determinism 和三个独立 session
+建立的 K0 median 为 `69.187576 ms`，CV `0.181687%`。K0 保持 216 VGPR、
+0 LDS/private/scratch 和 24 条 gfx12 BF16 WMMA。
+
+有界候选结果：
+
+- 将 64-thread/two-wave workgroup 拆为独立 wave32：`73.560783 ms`，
+  `0.945825x`，性能拒绝；
+- 跳过 `alpha==1` rescale 的全 wave fast path：S65/H56 exact replay 发散，
+  正确性拒绝；
+- 将 alpha fast path 限制到完整 32-query task：与上述相同的 S65/H56 发散，
+  该方向用尽；
+- Q fragment non-temporal load：`69.998222 ms`，`0.993883x`，性能拒绝；
+- dense interval-loop 专用化增加到 252 VGPR；split PV-fragment 增加到
+  256 VGPR/76-byte private/115 spills；launch-bounds 不改变 216 VGPR。这些只有静态
+  证据，未进入性能 controller。
+
+最终 controller 结果为 4 个候选全部拒绝，`best_id=K0`。不用以上候选
+替换当前 E33，也不重复 alpha-skip、wave32 workgroup 拆分或 Q non-temporal
+方向，除非新假设能解释之前的数值失败或资源/性能退化。
